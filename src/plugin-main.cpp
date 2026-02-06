@@ -40,8 +40,8 @@ struct trt_filter_data {
     ID3D11ComputeShader *postprocess_shader;
     
     // D3D11 buffers for TRT input/output (FP16 NCHW 1x3x256x256)
-    ID3D11Buffer *trt_input_buffer;   // Structured buffer for FP16 input
-    ID3D11Buffer *trt_output_buffer;  // Structured buffer for FP16 output
+    ID3D11Buffer *trt_input_buffer;
+    ID3D11Buffer *trt_output_buffer;
     ID3D11UnorderedAccessView *trt_input_uav;
     ID3D11UnorderedAccessView *trt_output_uav;
     ID3D11ShaderResourceView *trt_output_srv;
@@ -59,7 +59,12 @@ struct trt_filter_data {
     // TensorRT runner
     struct trt_runner trt_runner;
     bool trt_initialized;
-    
+
+    // Inference statistics
+    uint64_t inference_frame_count;
+    uint64_t inference_success_count;
+    uint64_t inference_fail_count;
+
     // D3D11 fence for synchronization (currently unused, placeholder for future sync)
     ID3D11Query *d3d11_fence;
     // ID3D11Fence *d3d11_fence_obj;
@@ -338,6 +343,16 @@ static bool init_tensorrt(struct trt_filter_data *filter)
     }
     
     filter->trt_initialized = true;
+    blog(LOG_INFO, "[TRT Filter] TensorRT initialized successfully - ready for inference");
+
+    // Log basic tensor info if dimensions are as expected
+    const nvinfer1::Dims& in_dims = filter->trt_runner.input_dims;
+    const nvinfer1::Dims& out_dims = filter->trt_runner.output_dims;
+    blog(LOG_INFO, "[TRT Filter] Input tensor '%s' dims nbDims=%d",
+         filter->trt_runner.input_name, in_dims.nbDims);
+    blog(LOG_INFO, "[TRT Filter] Output tensor '%s' dims nbDims=%d",
+         filter->trt_runner.output_name, out_dims.nbDims);
+    
     blog(LOG_INFO, "[TRT Filter] TensorRT initialized");
     
     return true;
@@ -490,6 +505,11 @@ static void *trt_filter_create(obs_data_t *settings, obs_source_t *source)
     filter->resources_allocated = false;
     filter->target_valid = false;
     filter->trt_initialized = false;
+
+    // Initialize inference statistics
+    filter->inference_frame_count = 0;
+    filter->inference_success_count = 0;
+    filter->inference_fail_count = 0;
     
     // CUDA runtime doesn't need explicit initialization
     // It will be initialized when we call cudaD3D11SetDirect3DDevice
@@ -723,12 +743,28 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
     filter->cuda_trt_output_ptr = d_output_ptr;
     
     // Step 4: Run TensorRT inference
+    filter->inference_frame_count++;
+    blog(LOG_DEBUG, "[TRT Filter] Frame %llu: starting TensorRT inference",
+         (unsigned long long)filter->inference_frame_count);
+
     trt_runner_set_buffers(&filter->trt_runner, filter->cuda_trt_input_ptr, filter->cuda_trt_output_ptr);
     if (!trt_runner_enqueue(&filter->trt_runner)) {
-        blog(LOG_ERROR, "[TRT Filter] TensorRT inference failed");
+        filter->inference_fail_count++;
+        blog(LOG_ERROR, "[TRT Filter] TensorRT inference failed (frame %llu, total fails: %llu)",
+             (unsigned long long)filter->inference_frame_count,
+             (unsigned long long)filter->inference_fail_count);
         cudaGraphicsUnmapResources(2, resources, filter->cuda_stream);
         obs_source_skip_video_filter(filter->context);
         return;
+    }
+
+    filter->inference_success_count++;
+    if (filter->inference_frame_count % 60 == 0) {
+        blog(LOG_INFO,
+             "[TRT Filter] Inference stats - total: %llu, success: %llu, failed: %llu",
+             (unsigned long long)filter->inference_frame_count,
+             (unsigned long long)filter->inference_success_count,
+             (unsigned long long)filter->inference_fail_count);
     }
     
     // Step 5: Synchronize CUDA -> D3D11

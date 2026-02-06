@@ -162,13 +162,16 @@ bool trt_runner_enqueue(struct trt_runner* runner) {
         return false;
     }
     
+    blog(LOG_DEBUG, "[TensorRT] Enqueuing inference on stream %p", (void*)runner->stream);
+
     // Run inference
     bool success = runner->context->enqueueV3(runner->stream);
     if (!success) {
-        blog(LOG_ERROR, "[TensorRT] Inference failed");
+        blog(LOG_ERROR, "[TensorRT] enqueueV3 returned false - inference failed");
         return false;
     }
     
+    blog(LOG_DEBUG, "[TensorRT] Inference enqueued successfully");
     return true;
 }
 
