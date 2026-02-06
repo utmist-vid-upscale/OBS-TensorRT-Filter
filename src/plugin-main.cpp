@@ -24,6 +24,7 @@ struct trt_filter_data {
     // Graphics resources
     gs_texrender_t *render_unorm;
     gs_texture_t *output_texture;
+    ID3D11Texture2D *output_d3d11_texture; //D3D11 texture with UAV support
     
     // Dimensions
     uint32_t width;
@@ -196,6 +197,11 @@ static bool create_graphics_resources(struct trt_filter_data *filter)
         filter->output_texture = nullptr;
     }
     
+    if (filter->output_d3d11_texture) {
+        filter->output_d3d11_texture->Release();
+        filter->output_d3d11_texture = nullptr;
+    }
+    
     // Create texrender for input (BGRA_UNORM, SRGB)
     filter->render_unorm = gs_texrender_create(GS_BGRA_UNORM, GS_ZS_NONE);
     if (!filter->render_unorm) {
@@ -203,7 +209,38 @@ static bool create_graphics_resources(struct trt_filter_data *filter)
         return false;
     }
     
-    // Create output texture (BGRA_UNORM)
+    // Get D3D11 device
+    ID3D11Device *device = (ID3D11Device *)gs_get_device_obj();
+    if (!device) {
+        blog(LOG_ERROR, "[TRT Filter] Failed to get D3D11 device");
+        gs_texrender_destroy(filter->render_unorm);
+        filter->render_unorm = nullptr;
+        return false;
+    }
+    
+    // Create output texture using D3D11 directly (with UAV binding support)
+    D3D11_TEXTURE2D_DESC tex_desc = {};
+    tex_desc.Width = filter->width;
+    tex_desc.Height = filter->height;
+    tex_desc.MipLevels = 1;
+    tex_desc.ArraySize = 1;
+    tex_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    tex_desc.SampleDesc.Count = 1;
+    tex_desc.SampleDesc.Quality = 0;
+    tex_desc.Usage = D3D11_USAGE_DEFAULT;
+    tex_desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    tex_desc.CPUAccessFlags = 0;
+    tex_desc.MiscFlags = 0;
+    
+    HRESULT hr = device->CreateTexture2D(&tex_desc, nullptr, &filter->output_d3d11_texture);
+    if (FAILED(hr)) {
+        blog(LOG_ERROR, "[TRT Filter] Failed to create D3D11 output texture (HR=0x%08X)", hr);
+        gs_texrender_destroy(filter->render_unorm);
+        filter->render_unorm = nullptr;
+        return false;
+    }
+    
+    // Create gs_texture for rendering (we'll copy from D3D11 texture to this)
     filter->output_texture = gs_texture_create(
         filter->width, 
         filter->height, 
@@ -213,6 +250,8 @@ static bool create_graphics_resources(struct trt_filter_data *filter)
         0);
     if (!filter->output_texture) {
         blog(LOG_ERROR, "[TRT Filter] Failed to create output texture");
+        filter->output_d3d11_texture->Release();
+        filter->output_d3d11_texture = nullptr;
         gs_texrender_destroy(filter->render_unorm);
         filter->render_unorm = nullptr;
         return false;
@@ -246,10 +285,11 @@ static bool create_trt_buffers(struct trt_filter_data *filter)
     
     // Create UAVs
     D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
-    uav_desc.Format = DXGI_FORMAT_R32_UINT;
+    uav_desc.Format = DXGI_FORMAT_UNKNOWN;  // Changed from DXGI_FORMAT_R32_UINT
     uav_desc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
     uav_desc.Buffer.FirstElement = 0;
     uav_desc.Buffer.NumElements = tensor_size;
+    uav_desc.Buffer.Flags = 0;  // Add this for clarity
     
     hr = device->CreateUnorderedAccessView(filter->trt_input_buffer, &uav_desc, &filter->trt_input_uav);
     D3D11_CHECK(hr, "Failed to create TRT input UAV");
@@ -259,7 +299,7 @@ static bool create_trt_buffers(struct trt_filter_data *filter)
     
     // Create SRV for output buffer (for postprocess shader)
     D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-    srv_desc.Format = DXGI_FORMAT_R32_UINT;
+    srv_desc.Format = DXGI_FORMAT_UNKNOWN;  // Changed from DXGI_FORMAT_R32_UINT
     srv_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
     srv_desc.Buffer.FirstElement = 0;
     srv_desc.Buffer.NumElements = tensor_size;
@@ -486,6 +526,9 @@ static void trt_filter_destroy(void *data)
     }
     if (filter->output_texture) {
         gs_texture_destroy(filter->output_texture);
+    }
+    if (filter->output_d3d11_texture) {
+        filter->output_d3d11_texture->Release();
     }
     
     obs_leave_graphics();
@@ -774,7 +817,8 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
     CUDA_CHECK_VOID(cudaGraphicsUnmapResources(2, resources, filter->cuda_stream));
     
     // Step 6: Postprocess with compute shader (FP16 NCHW -> BGRA)
-    ID3D11Texture2D *output_d3d11 = (ID3D11Texture2D *)gs_texture_get_obj(filter->output_texture);
+    // Use the D3D11 texture with UAV support
+    ID3D11Texture2D *output_d3d11 = filter->output_d3d11_texture;
     
     // Create UAV for output texture
     ID3D11UnorderedAccessView *output_uav = nullptr;
@@ -785,7 +829,7 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
     
     HRESULT hr = filter->d3d11_device->CreateUnorderedAccessView(output_d3d11, &uav_desc, &output_uav);
     if (FAILED(hr)) {
-        blog(LOG_ERROR, "[TRT Filter] Failed to create output UAV");
+        blog(LOG_ERROR, "[TRT Filter] Failed to create output UAV (HR=0x%08X)", hr);
         obs_source_skip_video_filter(filter->context);
         return;
     }
@@ -826,6 +870,12 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
     
     // Flush D3D11 commands
     filter->d3d11_context->Flush();
+
+    // Copy D3D11 texture to gs_texture for rendering
+    ID3D11Texture2D *gs_tex_d3d11 = (ID3D11Texture2D *)gs_texture_get_obj(filter->output_texture);
+    if (gs_tex_d3d11) {
+        filter->d3d11_context->CopyResource(gs_tex_d3d11, output_d3d11);
+    }
     
     // Step 7: Draw output texture
     if (!obs_source_process_filter_begin(filter->context, GS_BGRA_UNORM, OBS_NO_DIRECT_RENDERING)) {
@@ -868,7 +918,7 @@ OBS_MODULE_USE_DEFAULT_LOCALE("obs-tensorrt-filter", "en-US")
 
 bool obs_module_load(void)
 {
-    blog(LOG_INFO, "TensorRT inference filter plugin loaded (version %s)", PLUGIN_VERSION);
+    blog(LOG_INFO, "TensorRT inference filter plugin 3.0 loaded (version %s)", PLUGIN_VERSION);
     init_trt_filter_info();
     obs_register_source(&trt_filter_info);
     blog(LOG_INFO, "registering source (version %s)", PLUGIN_VERSION);
