@@ -16,76 +16,115 @@ add_library(${CMAKE_PROJECT_NAME} MODULE)
 find_package(libobs REQUIRED)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 
-# CUDA support - check for compiler first
-find_program(CUDA_NVCC_EXECUTABLE nvcc PATHS
-    "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.1/bin"
-    ENV CUDA_PATH
-    ENV CUDA_BIN_PATH
-    PATH_SUFFIXES bin
-)
+# CUDA headers for TensorRT (cuda_runtime_api.h, cuda_fp16.h, etc.)
+if(DEFINED ENV{CUDA_PATH})
+    message(STATUS "Using CUDA from $ENV{CUDA_PATH}")
+    target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "$ENV{CUDA_PATH}/include")
 
-if(CUDA_NVCC_EXECUTABLE)
-    # Extract CUDA toolkit root from nvcc path
-    get_filename_component(CUDA_TOOLKIT_ROOT "${CUDA_NVCC_EXECUTABLE}" DIRECTORY)
-    get_filename_component(CUDA_TOOLKIT_ROOT "${CUDA_TOOLKIT_ROOT}" DIRECTORY)
-
-    # Convert to Windows path format
-    file(TO_CMAKE_PATH "${CUDA_TOOLKIT_ROOT}" CUDA_TOOLKIT_ROOT)
-    
-    # Set CUDA paths explicitly with FORCE
-    set(CMAKE_CUDA_TOOLKIT_ROOT_DIR "${CUDA_TOOLKIT_ROOT}" CACHE PATH "CUDA Toolkit root directory" FORCE)
-    set(CMAKE_CUDA_COMPILER "${CUDA_NVCC_EXECUTABLE}" CACHE FILEPATH "CUDA compiler" FORCE)
-    set(CMAKE_VS_PLATFORM_TOOLSET_CUDA_CUSTOM_DIR "${CUDA_TOOLKIT_ROOT}" CACHE PATH "CUDA toolkit directory for Visual Studio integration" FORCE)
-
-    message(STATUS "CUDA Toolkit Root: ${CUDA_TOOLKIT_ROOT}")
-    
-    # Try to find CUDAToolkit BEFORE enable_language (Option 3 approach)
-    # This might help CMake discover the toolset
-    find_package(CUDAToolkit QUIET PATHS "${CUDA_TOOLKIT_ROOT}" NO_DEFAULT_PATH)
-    
-    if(CUDAToolkit_FOUND)
-        message(STATUS "CUDAToolkit found before enable_language")
-    else()
-        message(STATUS "CUDAToolkit not found yet, will try after enable_language")
-    endif()
-    
-    # Now enable CUDA language
-    enable_language(CUDA)
-    
-    # Find CUDA toolkit again (required this time)
-    find_package(CUDAToolkit REQUIRED)
-    
-    set(CMAKE_CUDA_STANDARD 17)
-    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-    
-    # Set CUDA properties for the kernel file
-    set_property(SOURCE src/cuda-kernel.cu PROPERTY CUDA_SEPARABLE_COMPILATION ON)
-    set_property(SOURCE src/cuda-kernel.cu PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-    
-    # Set CUDA architecture
-    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89" CACHE STRING "CUDA architectures to build for")
-    endif()
-    
-    # Link CUDA libraries
-    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE 
-        CUDA::cudart
-        CUDA::cuda_driver
+    # Link CUDA runtime library (for runtime D3D11 interop)
+    find_library(CUDA_RUNTIME_LIBRARY
+        NAMES cudart
+        PATHS "$ENV{CUDA_PATH}/lib/x64" "$ENV{CUDA_PATH}/lib"
+        NO_DEFAULT_PATH
     )
-    
-    # Add CUDA kernel source
-    target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/cuda-kernel.cu)
-    
-    message(STATUS "CUDA found - CUDA features enabled")
+    if(CUDA_RUNTIME_LIBRARY)
+        target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${CUDA_RUNTIME_LIBRARY})
+        message(STATUS "CUDA runtime library found: ${CUDA_RUNTIME_LIBRARY}")
+    else()
+        message(WARNING "CUDA runtime library not found - D3D11 interop may not work")
+    endif()
 else()
-    message(WARNING "CUDA compiler (nvcc) not found - building without CUDA support")
-    # Add compile definition to disable CUDA code
-    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE DISABLE_CUDA)
+    # Fallback: hard-coded path, adjust version as needed
+    target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
+        "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.1/include"
+    )
+    # Try to find cudart in fallback location
+    find_library(CUDA_RUNTIME_LIBRARY
+        NAMES cudart
+        PATHS "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.1/lib/x64"
+        NO_DEFAULT_PATH
+    )
+    if(CUDA_RUNTIME_LIBRARY)
+        target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${CUDA_RUNTIME_LIBRARY})
+    endif()
 endif()
 
-# Link D3D11 (required for CUDA-D3D11 interop, but also useful without CUDA)
+# Prevent HLSL files from being compiled at build time
+# They are compiled at runtime using D3DCompileFromFile
+file(GLOB HLSL_FILES "data/*.hlsl")
+foreach(HLSL_FILE ${HLSL_FILES})
+    set_source_files_properties(${HLSL_FILE} PROPERTIES
+        VS_TOOL_OVERRIDE "None"
+        HEADER_FILE_ONLY TRUE
+    )
+endforeach()
+
+# Prevent HLSL files from being compiled at build time
+# They are compiled at runtime using D3DCompileFromFile
+file(GLOB HLSL_FILES "data/*.hlsl")
+foreach(HLSL_FILE ${HLSL_FILES})
+    set_source_files_properties(${HLSL_FILE} PROPERTIES
+        VS_TOOL_OVERRIDE "None"
+        HEADER_FILE_ONLY TRUE
+    )
+endforeach()
+
+
+# Link D3D11 and D3DCompiler (required for CUDA-D3D11 interop and shader compilation)
 if(WIN32)
-    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE d3d11)
+    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE d3d11 d3dcompiler)
+    
+    # Add Windows-specific compile definitions
+    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
+        NOMINMAX  # Prevent Windows.h from defining min/max macros
+        WIN32_LEAN_AND_MEAN  # Reduce Windows.h bloat
+    )
+endif()
+
+# TensorRT support
+# Try multiple common installation paths
+set(TENSORRT_POSSIBLE_ROOTS
+    "C:/TensorRT-10.14.1.48"
+    "C:/TensorRT-10.1"
+    "C:/TensorRT-10.0"
+    "$ENV{TENSORRT_ROOT}"
+    "$ENV{TENSORRT_PATH}"
+)
+
+find_path(TENSORRT_INCLUDE_DIR
+    NvInfer.h
+    PATHS ${TENSORRT_POSSIBLE_ROOTS}
+    PATH_SUFFIXES include
+    NO_DEFAULT_PATH
+)
+
+# If not found in specific paths, try default system paths
+if(NOT TENSORRT_INCLUDE_DIR)
+    find_path(TENSORRT_INCLUDE_DIR NvInfer.h PATH_SUFFIXES include)
+endif()
+
+find_library(TENSORRT_LIBRARY
+    NAMES nvinfer nvinfer_10
+    PATHS ${TENSORRT_POSSIBLE_ROOTS}
+    PATH_SUFFIXES lib lib/x64
+    NO_DEFAULT_PATH
+)
+
+# If not found in specific paths, try default system paths
+if(NOT TENSORRT_LIBRARY)
+    find_library(TENSORRT_LIBRARY NAMES nvinfer nvinfer_10 PATH_SUFFIXES lib lib64)
+endif()
+
+if(TENSORRT_INCLUDE_DIR AND TENSORRT_LIBRARY)
+    target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${TENSORRT_INCLUDE_DIR})
+    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${TENSORRT_LIBRARY})
+    message(STATUS "TensorRT found:")
+    message(STATUS "  Include: ${TENSORRT_INCLUDE_DIR}")
+    message(STATUS "  Library: ${TENSORRT_LIBRARY}")
+else()
+    message(FATAL_ERROR "TensorRT not found - plugin requires TensorRT to build")
+    message(STATUS "  Searched in: ${TENSORRT_POSSIBLE_ROOTS}")
+    message(STATUS "  Set TENSORRT_ROOT environment variable to TensorRT installation directory")
 endif()
 
 if(ENABLE_FRONTEND_API)
@@ -106,7 +145,26 @@ if(ENABLE_QT)
   )
 endif()
 
-# Add main plugin source (always included)
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c)
+# Set C++ standard for TensorRT runner (C++17 required for TensorRT 10.x)
+set_property(TARGET ${CMAKE_PROJECT_NAME} PROPERTY CXX_STANDARD 17)
+set_property(TARGET ${CMAKE_PROJECT_NAME} PROPERTY CXX_STANDARD_REQUIRED ON)
+
+# Add main plugin source and TensorRT runner (always included)
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE 
+    src/plugin-main.cpp
+    src/trt_runner.cpp
+)
+
+# Ensure these sources are compiled as C++
+set_source_files_properties(
+    src/trt_runner.cpp
+    src/plugin-main.cpp
+    PROPERTIES LANGUAGE CXX
+)
+
+# On MSVC, disable deprecation warning C4996 coming from TensorRT headers
+if(MSVC)
+    target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE /wd4996)
+endif()
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
