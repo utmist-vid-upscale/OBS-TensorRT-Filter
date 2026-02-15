@@ -5,6 +5,7 @@
 #include <graphics/graphics.h>
 #include <util/platform.h>
 #include <stdbool.h>
+#include <string.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <cuda_runtime.h>
@@ -15,7 +16,7 @@
 #define PLUGIN_VERSION "1.0.0"
 
 // Engine file path (can be made configurable)
-#define DEFAULT_ENGINE_PATH "identity_cnn_256_fp16.engine"
+#define DEFAULT_ENGINE_PATH "realesrgan_256_fp16.engine"
 
 /* Per-instance data */
 struct trt_filter_data {
@@ -40,7 +41,9 @@ struct trt_filter_data {
     ID3D11ComputeShader *preprocess_shader;
     ID3D11ComputeShader *postprocess_shader;
     
-    // D3D11 buffers for TRT input/output (FP16 NCHW 1x3x256x256)
+    // D3D11 buffers for TRT input/output
+    // Input: FP16 NCHW 1x3x256x256
+    // Output: FP16 NCHW 1x3x1024x1024
     ID3D11Buffer *trt_input_buffer;
     ID3D11Buffer *trt_output_buffer;
     ID3D11UnorderedAccessView *trt_input_uav;
@@ -265,44 +268,66 @@ static bool create_trt_buffers(struct trt_filter_data *filter)
 {
     ID3D11Device *device = filter->d3d11_device;
     
-    // TRT expects FP16 NCHW 1x3x256x256
-    const uint32_t tensor_size = 1 * 3 * 256 * 256;
+    // TRT input: FP16 NCHW 1x3x256x256
+    const uint32_t input_tensor_size = 1 * 3 * 256 * 256;
+    // TRT output: FP16 NCHW 1x3x1024x1024
+    const uint32_t output_tensor_size = 1 * 3 * 1024 * 1024;
+    
+    blog(LOG_INFO, "[TRT Filter] Creating TRT buffers - Input: %u elements, Output: %u elements", 
+         input_tensor_size, output_tensor_size);
     
     // Create structured buffer for input (RWStructuredBuffer<uint> in shader, stores FP16 in low 16 bits)
-    D3D11_BUFFER_DESC buffer_desc = {};
-    buffer_desc.Usage = D3D11_USAGE_DEFAULT;
-    buffer_desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
-    buffer_desc.CPUAccessFlags = 0;
-    buffer_desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-    buffer_desc.StructureByteStride = sizeof(uint32_t); // we store FP16 in lower 16 bits of uint
-    buffer_desc.ByteWidth = tensor_size * sizeof(uint32_t);
+    D3D11_BUFFER_DESC input_buffer_desc = {};
+    input_buffer_desc.Usage = D3D11_USAGE_DEFAULT;
+    input_buffer_desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+    input_buffer_desc.CPUAccessFlags = 0;
+    input_buffer_desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    input_buffer_desc.StructureByteStride = sizeof(uint32_t); // we store FP16 in lower 16 bits of uint
+    input_buffer_desc.ByteWidth = input_tensor_size * sizeof(uint32_t);
     
-    HRESULT hr = device->CreateBuffer(&buffer_desc, nullptr, &filter->trt_input_buffer);
+    HRESULT hr = device->CreateBuffer(&input_buffer_desc, nullptr, &filter->trt_input_buffer);
     D3D11_CHECK(hr, "Failed to create TRT input buffer");
     
-    hr = device->CreateBuffer(&buffer_desc, nullptr, &filter->trt_output_buffer);
+    // Create structured buffer for output (larger size)
+    D3D11_BUFFER_DESC output_buffer_desc = {};
+    output_buffer_desc.Usage = D3D11_USAGE_DEFAULT;
+    output_buffer_desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+    output_buffer_desc.CPUAccessFlags = 0;
+    output_buffer_desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    output_buffer_desc.StructureByteStride = sizeof(uint32_t);
+    output_buffer_desc.ByteWidth = output_tensor_size * sizeof(uint32_t);
+    
+    hr = device->CreateBuffer(&output_buffer_desc, nullptr, &filter->trt_output_buffer);
     D3D11_CHECK(hr, "Failed to create TRT output buffer");
     
-    // Create UAVs
-    D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
-    uav_desc.Format = DXGI_FORMAT_UNKNOWN;  // Changed from DXGI_FORMAT_R32_UINT
-    uav_desc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-    uav_desc.Buffer.FirstElement = 0;
-    uav_desc.Buffer.NumElements = tensor_size;
-    uav_desc.Buffer.Flags = 0;  // Add this for clarity
+    // Create UAVs for input
+    D3D11_UNORDERED_ACCESS_VIEW_DESC input_uav_desc = {};
+    input_uav_desc.Format = DXGI_FORMAT_UNKNOWN;
+    input_uav_desc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    input_uav_desc.Buffer.FirstElement = 0;
+    input_uav_desc.Buffer.NumElements = input_tensor_size;
+    input_uav_desc.Buffer.Flags = 0;
     
-    hr = device->CreateUnorderedAccessView(filter->trt_input_buffer, &uav_desc, &filter->trt_input_uav);
+    hr = device->CreateUnorderedAccessView(filter->trt_input_buffer, &input_uav_desc, &filter->trt_input_uav);
     D3D11_CHECK(hr, "Failed to create TRT input UAV");
     
-    hr = device->CreateUnorderedAccessView(filter->trt_output_buffer, &uav_desc, &filter->trt_output_uav);
+    // Create UAVs for output
+    D3D11_UNORDERED_ACCESS_VIEW_DESC output_uav_desc = {};
+    output_uav_desc.Format = DXGI_FORMAT_UNKNOWN;
+    output_uav_desc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    output_uav_desc.Buffer.FirstElement = 0;
+    output_uav_desc.Buffer.NumElements = output_tensor_size;
+    output_uav_desc.Buffer.Flags = 0;
+    
+    hr = device->CreateUnorderedAccessView(filter->trt_output_buffer, &output_uav_desc, &filter->trt_output_uav);
     D3D11_CHECK(hr, "Failed to create TRT output UAV");
     
     // Create SRV for output buffer (for postprocess shader)
     D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-    srv_desc.Format = DXGI_FORMAT_UNKNOWN;  // Changed from DXGI_FORMAT_R32_UINT
+    srv_desc.Format = DXGI_FORMAT_UNKNOWN;
     srv_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
     srv_desc.Buffer.FirstElement = 0;
-    srv_desc.Buffer.NumElements = tensor_size;
+    srv_desc.Buffer.NumElements = output_tensor_size;
     
     hr = device->CreateShaderResourceView(filter->trt_output_buffer, &srv_desc, &filter->trt_output_srv);
     D3D11_CHECK(hr, "Failed to create TRT output SRV");
@@ -343,7 +368,16 @@ static bool init_cuda_resources(struct trt_filter_data *filter)
     }
     
     // Set D3D11 device for CUDA runtime (creates/manages context automatically)
-    CUDA_CHECK(cudaD3D11SetDirect3DDevice(filter->d3d11_device));
+    // Note: This can only be called once per process. If called again, it returns
+    // cudaErrorSetOnActiveProcess, which we can safely ignore.
+    cudaError_t err = cudaD3D11SetDirect3DDevice(filter->d3d11_device);
+    if (err != cudaSuccess && err != cudaErrorSetOnActiveProcess) {
+        blog(LOG_ERROR, "[TRT Filter] CUDA error at %s:%d - %s", __FILE__, __LINE__, cudaGetErrorString(err));
+        return false;
+    }
+    if (err == cudaErrorSetOnActiveProcess) {
+        blog(LOG_DEBUG, "[TRT Filter] CUDA device already set (multiple filter instances), continuing...");
+    }
     
     // Create CUDA stream
     CUDA_CHECK(cudaStreamCreate(&filter->cuda_stream));
@@ -373,27 +407,71 @@ static bool init_tensorrt(struct trt_filter_data *filter)
         return false;
     }
     
+    blog(LOG_INFO, "[TRT Filter] Loading TensorRT engine from: %s", engine_path);
+    
     // Use runtime stream directly (no conversion needed)
     bool success = trt_runner_init(&filter->trt_runner, engine_path, filter->cuda_stream);
     bfree(engine_path);
     
     if (!success) {
-        blog(LOG_ERROR, "[TRT Filter] Failed to initialize TensorRT");
+        blog(LOG_ERROR, "[TRT Filter] Failed to initialize TensorRT - falling back to passthrough");
         return false;
     }
     
+    // Verify tensor names match expected values
+    if (strcmp(filter->trt_runner.input_name, "input") != 0) {
+        blog(LOG_WARNING, "[TRT Filter] Input tensor name '%s' does not match expected 'input'", 
+             filter->trt_runner.input_name);
+    }
+    if (strcmp(filter->trt_runner.output_name, "output") != 0) {
+        blog(LOG_WARNING, "[TRT Filter] Output tensor name '%s' does not match expected 'output'", 
+             filter->trt_runner.output_name);
+    }
+    
     filter->trt_initialized = true;
-    blog(LOG_INFO, "[TRT Filter] TensorRT initialized successfully - ready for inference");
-
-    // Log basic tensor info if dimensions are as expected
+    
+    // Log detailed tensor info
     const nvinfer1::Dims& in_dims = filter->trt_runner.input_dims;
     const nvinfer1::Dims& out_dims = filter->trt_runner.output_dims;
-    blog(LOG_INFO, "[TRT Filter] Input tensor '%s' dims nbDims=%d",
-         filter->trt_runner.input_name, in_dims.nbDims);
-    blog(LOG_INFO, "[TRT Filter] Output tensor '%s' dims nbDims=%d",
-         filter->trt_runner.output_name, out_dims.nbDims);
     
-    blog(LOG_INFO, "[TRT Filter] TensorRT initialized");
+    blog(LOG_INFO, "[TRT Filter] TensorRT initialized successfully");
+    blog(LOG_INFO, "[TRT Filter] Input tensor '%s': shape [", filter->trt_runner.input_name);
+    for (int i = 0; i < in_dims.nbDims; i++) {
+        blog(LOG_INFO, "[TRT Filter]   dim[%d] = %d", i, in_dims.d[i]);
+    }
+    blog(LOG_INFO, "[TRT Filter] ] (type: %s)", 
+         filter->trt_runner.input_type == nvinfer1::DataType::kFLOAT ? "FLOAT" : "HALF");
+    
+    blog(LOG_INFO, "[TRT Filter] Output tensor '%s': shape [", filter->trt_runner.output_name);
+    for (int i = 0; i < out_dims.nbDims; i++) {
+        blog(LOG_INFO, "[TRT Filter]   dim[%d] = %d", i, out_dims.d[i]);
+    }
+    blog(LOG_INFO, "[TRT Filter] ] (type: %s)", 
+         filter->trt_runner.output_type == nvinfer1::DataType::kFLOAT ? "FLOAT" : "HALF");
+    
+    // Verify expected shapes
+    bool shape_valid = true;
+    if (in_dims.nbDims == 4 && 
+        in_dims.d[0] == 1 && in_dims.d[1] == 3 && in_dims.d[2] == 256 && in_dims.d[3] == 256) {
+        blog(LOG_INFO, "[TRT Filter] Input shape matches expected [1, 3, 256, 256]");
+    } else {
+        blog(LOG_WARNING, "[TRT Filter] Input shape does not match expected [1, 3, 256, 256]");
+        shape_valid = false;
+    }
+    
+    if (out_dims.nbDims == 4 && 
+        out_dims.d[0] == 1 && out_dims.d[1] == 3 && out_dims.d[2] == 1024 && out_dims.d[3] == 1024) {
+        blog(LOG_INFO, "[TRT Filter] Output shape matches expected [1, 3, 1024, 1024]");
+    } else {
+        blog(LOG_WARNING, "[TRT Filter] Output shape does not match expected [1, 3, 1024, 1024]");
+        shape_valid = false;
+    }
+    
+    if (!shape_valid) {
+        blog(LOG_WARNING, "[TRT Filter] Tensor shapes do not match expected values - filter may not work correctly");
+    }
+    
+    blog(LOG_INFO, "[TRT Filter] Ready for inference");
     
     return true;
 }
@@ -612,7 +690,7 @@ static void trt_filter_tick(void *data, float seconds)
         
         filter->d3d11_device->GetImmediateContext(&filter->d3d11_context);
         
-        // Create TRT buffers (only once, size is fixed at 256x256)
+        // Create TRT buffers (only once, sizes are fixed: input 256×256, output 1024×1024)
         if (!filter->trt_input_buffer) {
             if (!create_trt_buffers(filter)) {
                 filter->resources_allocated = false;
@@ -649,6 +727,16 @@ static void trt_filter_tick(void *data, float seconds)
         }
         
         filter->resources_allocated = true;
+        
+        // Log resize policies
+        blog(LOG_INFO, "[TRT Filter] Graphics resources allocated");
+        blog(LOG_INFO, "[TRT Filter] Preprocess resize policy: W×H (%ux%u) → 256×256 (centered crop/resize)", 
+             filter->width, filter->height);
+        blog(LOG_INFO, "[TRT Filter] Postprocess resample policy: 1024×1024 → W×H (%ux%u) (bilinear interpolation)", 
+             filter->width, filter->height);
+        blog(LOG_INFO, "[TRT Filter] Final output texture size: %ux%u (matches input size)", 
+             filter->width, filter->height);
+        
         obs_leave_graphics();
     }
 }
@@ -728,10 +816,11 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
     constants.output_size[0] = 256;
     constants.output_size[1] = 256;
     
-    // Calculate scale and offset for centered crop
+    // Preprocess resize policy: Centered crop/resize from W×H → 256×256
+    // This maintains aspect ratio by scaling to fit the smaller dimension, then cropping the larger dimension
     float scale_x = (float)filter->width / 256.0f;
     float scale_y = (float)filter->height / 256.0f;
-    float scale = (scale_x > scale_y) ? scale_x : scale_y;
+    float scale = (scale_x > scale_y) ? scale_x : scale_y;  // Use larger scale to ensure coverage
     constants.scale[0] = scale;
     constants.scale[1] = scale;
     constants.offset[0] = (filter->width - 256.0f * scale) * 0.5f;
@@ -835,15 +924,16 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
     }
     
     // Update constant buffer for postprocess
+    // TRT output is 1024x1024, we need to resample to W×H
     struct {
-        uint32_t output_size[2];
-        uint32_t tensor_size[2];
+        uint32_t output_size[2];      // Final output texture size (W×H)
+        uint32_t tensor_size[2];       // TRT output tensor size (1024×1024)
     } post_constants;
     
     post_constants.output_size[0] = filter->width;
     post_constants.output_size[1] = filter->height;
-    post_constants.tensor_size[0] = 256;
-    post_constants.tensor_size[1] = 256;
+    post_constants.tensor_size[0] = 1024;
+    post_constants.tensor_size[1] = 1024;
     
     filter->d3d11_context->Map(filter->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
     memcpy(mapped.pData, &post_constants, sizeof(post_constants));
@@ -918,7 +1008,7 @@ OBS_MODULE_USE_DEFAULT_LOCALE("obs-tensorrt-filter", "en-US")
 
 bool obs_module_load(void)
 {
-    blog(LOG_INFO, "TensorRT inference filter plugin 3.0 loaded (version %s)", PLUGIN_VERSION);
+    blog(LOG_INFO, "TensorRT  Real-ESRGAN inference filter plugin 1.0 loaded (version %s)", PLUGIN_VERSION);
     init_trt_filter_info();
     obs_register_source(&trt_filter_info);
     blog(LOG_INFO, "registering source (version %s)", PLUGIN_VERSION);
