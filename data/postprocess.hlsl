@@ -2,6 +2,8 @@
 // Reads FP16 NCHW tensor (1024x1024), converts to BGRA8 UNORM, resamples to output texture size (W×H)
 // Resample policy: Bilinear interpolation from 1024×1024 → W×H
 
+#define DEBUG_POSTPROCESS 1  // Set to 1 to write solid magenta for debugging
+
 StructuredBuffer<uint> InputBuffer : register(t0);  // FP16 values (one per element, stored as uint)
 RWTexture2D<float4> OutputTexture : register(u0);
 
@@ -72,12 +74,21 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // Using bilinear resampling: 1024×1024 → W×H
     float2 tensorUV = (float2(id.xy) + 0.5) * (float2(TensorSize) / float2(OutputSize));
     
+#if DEBUG_POSTPROCESS
+    // DEBUG: Write solid magenta to prove postprocess is executing
+    // Magenta in BGRA format: B=1.0, G=0.0, R=1.0, A=1.0
+    OutputTexture[id.xy] = float4(1.0, 0.0, 1.0, 1.0);
+#else
     // Sample with bilinear interpolation
     float3 rgb = SampleTensorBilinear(tensorUV);
     
     // Clamp to [0,1] and convert to BGRA
     rgb = saturate(rgb);
+
+    // DEBUG: prove postprocess output is rendered
+    rgb = 1.0 - rgb;
     
     // Write BGRA (swap R and B channels for D3D11 BGRA format)
     OutputTexture[id.xy] = float4(rgb.b, rgb.g, rgb.r, 1.0);
+#endif
 }
