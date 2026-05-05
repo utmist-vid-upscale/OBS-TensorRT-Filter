@@ -19,6 +19,10 @@
 // Engine file path (can be made configurable)
 #define DEFAULT_ENGINE_PATH "realesrgan_256_fp16.engine"
 
+// Set to 1 to enable verbose per-frame debug logging (normally 0)
+#define TRT_VERBOSE 0
+#define BLOG_VERBOSE(fmt, ...) do { if (TRT_VERBOSE) blog(LOG_INFO, fmt, ##__VA_ARGS__); } while(0)
+
 /* Per-instance data */
 struct trt_filter_data {
     obs_source_t *context;
@@ -53,6 +57,7 @@ struct trt_filter_data {
     
     // Constant buffer for shaders
     ID3D11Buffer *constant_buffer;
+    ID3D11SamplerState *linear_sampler;
     
     // CUDA resources (runtime API)
     cudaStream_t cuda_stream;
@@ -285,19 +290,6 @@ static bool create_graphics_resources(struct trt_filter_data *filter)
         return false;
     }
     
-    // DEBUG: Check if textures are the same object at creation time
-    ID3D11Texture2D *gs_tex_d3d11_check = (ID3D11Texture2D *)gs_texture_get_obj(filter->output_texture);
-    blog(LOG_INFO, "[TRT Filter] TEXTURE CREATION DEBUG:");
-    blog(LOG_INFO, "  - output_d3d11_texture (created via D3D11): %p", filter->output_d3d11_texture);
-    blog(LOG_INFO, "  - output_texture underlying D3D11 (from gs_texture_get_obj): %p", gs_tex_d3d11_check);
-    blog(LOG_INFO, "  - Textures are same object: %s", 
-         (filter->output_d3d11_texture == gs_tex_d3d11_check) ? "YES" : "NO");
-    if (filter->output_d3d11_texture != gs_tex_d3d11_check) {
-        blog(LOG_INFO, "  - NOTE: Textures are different objects - CopyResource will be needed each frame");
-    } else {
-        blog(LOG_INFO, "  - NOTE: Textures are same object - CopyResource is a no-op");
-    }
-    
     return true;
 }
 
@@ -379,7 +371,18 @@ static bool create_trt_buffers(struct trt_filter_data *filter)
     
     hr = device->CreateBuffer(&cb_desc, nullptr, &filter->constant_buffer);
     D3D11_CHECK(hr, "Failed to create constant buffer");
-    
+
+    // Create linear clamp sampler for preprocess shader
+    D3D11_SAMPLER_DESC sampler_desc = {};
+    sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+    hr = device->CreateSamplerState(&sampler_desc, &filter->linear_sampler);
+    D3D11_CHECK(hr, "Failed to create linear sampler");
+
+    blog(LOG_INFO, "[TRT Filter] Linear sampler created");
     return true;
 }
 
@@ -657,6 +660,11 @@ static void cleanup_d3d11_resources(struct trt_filter_data *filter)
         filter->constant_buffer->Release();
         filter->constant_buffer = nullptr;
     }
+
+    if (filter->linear_sampler) {
+        filter->linear_sampler->Release();
+        filter->linear_sampler = nullptr;
+    }
     
     if (filter->preprocess_shader) {
         filter->preprocess_shader->Release();
@@ -766,7 +774,6 @@ static const char *get_first_technique_name(gs_effect_t *effect, bool is_solid)
     for (int i = 0; techniques_to_try[i]; i++) {
         gs_technique_t *tech = gs_effect_get_technique(effect, techniques_to_try[i]);
         if (tech) {
-            blog(LOG_INFO, "[TRT Filter] DEBUG - Found valid technique: '%s'", techniques_to_try[i]);
             return techniques_to_try[i];
         }
     }
@@ -1006,30 +1013,18 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
     
     auto *filter = static_cast<trt_filter_data *>(data);
     
-    // Log filter attachment info
-    static bool attachment_logged = false;
-    if (!attachment_logged) {
-        const char *source_name = obs_source_get_name(filter->context);
-        obs_source_t *parent = obs_filter_get_parent(filter->context);
-        const char *parent_name = parent ? obs_source_get_name(parent) : nullptr;
-        blog(LOG_INFO, "[TRT Filter] CANARY - Filter Attachment:");
-        blog(LOG_INFO, "  - Current source: %p (name: %s)", filter->context, source_name ? source_name : "(null)");
-        blog(LOG_INFO, "  - Parent source: %p (name: %s)", parent, parent_name ? parent_name : "(null)");
-        attachment_logged = true;
-    }
-    
     if (!filter->target_valid || !filter->resources_allocated || !filter->trt_initialized) {
-        blog(LOG_WARNING, "[TRT Filter] CANARY - Early return: target_valid=%d, resources_allocated=%d, trt_initialized=%d",
+        blog(LOG_WARNING, "[TRT Filter] Early return: target_valid=%d, resources_allocated=%d, trt_initialized=%d",
              filter->target_valid, filter->resources_allocated, filter->trt_initialized);
         obs_source_skip_video_filter(filter->context);
         return;
     }
-    
+
     obs_source_t *target = obs_filter_get_target(filter->context);
     obs_source_t *parent = obs_filter_get_parent(filter->context);
-    
+
     if (!target || !parent) {
-        blog(LOG_WARNING, "[TRT Filter] CANARY - Early return: target=%p, parent=%p", target, parent);
+        blog(LOG_WARNING, "[TRT Filter] Early return: target=%p, parent=%p", target, parent);
         obs_source_skip_video_filter(filter->context);
         return;
     }
@@ -1067,14 +1062,65 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
     gs_texture_t *input_texture = gs_texrender_get_texture(render_unorm);
     ID3D11Texture2D *input_d3d11 = (ID3D11Texture2D *)gs_texture_get_obj(input_texture);
     
-    // Create SRV for input texture
+    // Create SRV for input texture using the texture's actual format
+    if (!input_d3d11) {
+        blog(LOG_ERROR, "[TRT Filter] Preprocess: input_d3d11 is null (gs_texrender_get_texture returned null)");
+        obs_source_skip_video_filter(filter->context);
+        return;
+    }
+
+    D3D11_TEXTURE2D_DESC input_tex_desc = {};
+    input_d3d11->GetDesc(&input_tex_desc);
+
+    static bool srv_format_logged = false;
+    if (!srv_format_logged) {
+        blog(LOG_INFO, "[TRT Filter] Preprocess input texture: %ux%u format=%d",
+             input_tex_desc.Width, input_tex_desc.Height, (int)input_tex_desc.Format);
+
+        // One-time center-pixel readback to verify source texture content
+        D3D11_TEXTURE2D_DESC staging_desc = input_tex_desc;
+        staging_desc.Usage          = D3D11_USAGE_STAGING;
+        staging_desc.BindFlags      = 0;
+        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        staging_desc.MiscFlags      = 0;
+        staging_desc.MipLevels      = 1;
+        ID3D11Texture2D *staging = nullptr;
+        HRESULT st_hr = filter->d3d11_device->CreateTexture2D(&staging_desc, nullptr, &staging);
+        if (SUCCEEDED(st_hr) && staging) {
+            filter->d3d11_context->CopyResource(staging, input_d3d11);
+            D3D11_MAPPED_SUBRESOURCE st_mapped = {};
+            if (SUCCEEDED(filter->d3d11_context->Map(staging, 0, D3D11_MAP_READ, 0, &st_mapped))) {
+                uint32_t cx = input_tex_desc.Width  / 2;
+                uint32_t cy = input_tex_desc.Height / 2;
+                const uint8_t *row = (const uint8_t *)st_mapped.pData + cy * st_mapped.RowPitch;
+                const uint8_t *px  = row + cx * 4;  // 4 bytes per BGRA pixel
+                blog(LOG_INFO, "[TRT Filter] Source texture center pixel (BGRA): B=%d G=%d R=%d A=%d",
+                     px[0], px[1], px[2], px[3]);
+                filter->d3d11_context->Unmap(staging, 0);
+            } else {
+                blog(LOG_WARNING, "[TRT Filter] Source texture readback: Map failed");
+            }
+            staging->Release();
+        } else {
+            blog(LOG_WARNING, "[TRT Filter] Source texture readback: CreateTexture2D failed (HR=0x%08X)", st_hr);
+        }
+
+        srv_format_logged = true;
+    }
+
     ID3D11ShaderResourceView *input_srv = nullptr;
     D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-    srv_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    srv_desc.Format = input_tex_desc.Format;  // match actual texture format, not assumed UNORM
     srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
     srv_desc.Texture2D.MipLevels = 1;
     srv_desc.Texture2D.MostDetailedMip = 0;
-    filter->d3d11_device->CreateShaderResourceView(input_d3d11, &srv_desc, &input_srv);
+    HRESULT srv_hr = filter->d3d11_device->CreateShaderResourceView(input_d3d11, &srv_desc, &input_srv);
+    if (FAILED(srv_hr)) {
+        blog(LOG_ERROR, "[TRT Filter] Preprocess: CreateShaderResourceView failed (HR=0x%08X, format=%d)",
+             srv_hr, (int)input_tex_desc.Format);
+        obs_source_skip_video_filter(filter->context);
+        return;
+    }
     
     // Update constant buffer
     struct {
@@ -1104,20 +1150,39 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
     memcpy(mapped.pData, &constants, sizeof(constants));
     filter->d3d11_context->Unmap(filter->constant_buffer, 0);
     
+    // Unbind any active OM render targets before binding CS SRV.
+    // D3D11 hazard detection silently nulls CS t0 if input_d3d11 is still
+    // bound as an RTV (OBS leaves it bound after gs_texrender_end restores
+    // the previous RT stack). obs_source_process_filter_begin (Step 7) will
+    // re-establish the correct RT before drawing.
+    filter->d3d11_context->OMSetRenderTargets(0, nullptr, nullptr);
+
     // Set compute shader state
     filter->d3d11_context->CSSetShader(filter->preprocess_shader, nullptr, 0);
     filter->d3d11_context->CSSetConstantBuffers(0, 1, &filter->constant_buffer);
     filter->d3d11_context->CSSetShaderResources(0, 1, &input_srv);
     filter->d3d11_context->CSSetUnorderedAccessViews(0, 1, &filter->trt_input_uav, nullptr);
-    
+    filter->d3d11_context->CSSetSamplers(0, 1, &filter->linear_sampler);
+
+    // One-time binding probe
+    static bool binding_logged = false;
+    if (!binding_logged) {
+        blog(LOG_INFO, "[TRT Filter] Preprocess binding: srv=%p sampler=%p uav=%p shader=%p",
+             input_srv, filter->linear_sampler,
+             filter->trt_input_uav, filter->preprocess_shader);
+        binding_logged = true;
+    }
+
     // Dispatch compute shader (256x256 = 16x16 thread groups)
     filter->d3d11_context->Dispatch(16, 16, 1);
-    
+
     // Unbind resources
     ID3D11ShaderResourceView *null_srv = nullptr;
     ID3D11UnorderedAccessView *null_uav = nullptr;
+    ID3D11SamplerState *null_sampler = nullptr;
     filter->d3d11_context->CSSetShaderResources(0, 1, &null_srv);
     filter->d3d11_context->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
+    filter->d3d11_context->CSSetSamplers(0, 1, &null_sampler);
     
     if (input_srv) {
         input_srv->Release();
@@ -1146,11 +1211,21 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
     
     filter->cuda_trt_input_ptr = d_input_ptr;
     filter->cuda_trt_output_ptr = d_output_ptr;
-    
+
+    // Buffer probe: log first 8 floats at frame 1 and every 120 frames
+    static uint64_t probe_frame = 0;
+    probe_frame++;
+    bool do_probe = (probe_frame == 1 || probe_frame % 120 == 0);
+    if (do_probe) {
+        float in_vals[8] = {};
+        cudaMemcpy(in_vals, d_input_ptr, 8 * sizeof(float), cudaMemcpyDeviceToHost);
+        blog(LOG_INFO, "[TRT Filter] TRT input[0..7]: %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f",
+             in_vals[0], in_vals[1], in_vals[2], in_vals[3],
+             in_vals[4], in_vals[5], in_vals[6], in_vals[7]);
+    }
+
     // Step 4: Run TensorRT inference
     filter->inference_frame_count++;
-    blog(LOG_DEBUG, "[TRT Filter] Frame %llu: starting TensorRT inference",
-         (unsigned long long)filter->inference_frame_count);
 
     trt_runner_set_buffers(&filter->trt_runner, filter->cuda_trt_input_ptr, filter->cuda_trt_output_ptr);
     if (!trt_runner_enqueue(&filter->trt_runner)) {
@@ -1158,7 +1233,6 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
         blog(LOG_ERROR, "[TRT Filter] TensorRT inference failed (frame %llu, total fails: %llu)",
              (unsigned long long)filter->inference_frame_count,
              (unsigned long long)filter->inference_fail_count);
-        blog(LOG_WARNING, "[TRT Filter] CANARY - Early return: TensorRT inference failed");
         cudaGraphicsUnmapResources(2, resources, filter->cuda_stream);
         obs_source_skip_video_filter(filter->context);
         return;
@@ -1175,7 +1249,15 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
     
     // Step 5: Synchronize CUDA -> D3D11
     CUDA_CHECK_VOID(cudaStreamSynchronize(filter->cuda_stream));
-    
+
+    if (do_probe) {
+        float out_vals[8] = {};
+        cudaMemcpy(out_vals, d_output_ptr, 8 * sizeof(float), cudaMemcpyDeviceToHost);
+        blog(LOG_INFO, "[TRT Filter] TRT output[0..7]: %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f",
+             out_vals[0], out_vals[1], out_vals[2], out_vals[3],
+             out_vals[4], out_vals[5], out_vals[6], out_vals[7]);
+    }
+
     // Unmap CUDA resources
     CUDA_CHECK_VOID(cudaGraphicsUnmapResources(2, resources, filter->cuda_stream));
     
@@ -1193,25 +1275,9 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
     HRESULT hr = filter->d3d11_device->CreateUnorderedAccessView(output_d3d11, &uav_desc, &output_uav);
     if (FAILED(hr)) {
         blog(LOG_ERROR, "[TRT Filter] Failed to create output UAV (HR=0x%08X)", hr);
-        blog(LOG_WARNING, "[TRT Filter] CANARY - Early return: Failed to create output UAV");
         obs_source_skip_video_filter(filter->context);
         return;
     }
-    
-    // DEBUG 1: Log postprocess output UAV and resource pointers
-    ID3D11Resource *uav_resource = nullptr;
-    output_uav->GetResource(&uav_resource);
-    ID3D11Resource *output_d3d11_resource = nullptr;
-    output_d3d11->QueryInterface(__uuidof(ID3D11Resource), (void**)&output_d3d11_resource);
-    blog(LOG_INFO, "[TRT Filter] DEBUG 1 - Postprocess Output UAV Binding:");
-    blog(LOG_INFO, "  - output_uav pointer: %p", output_uav);
-    blog(LOG_INFO, "  - output_uav->GetResource(): %p", uav_resource);
-    blog(LOG_INFO, "  - output_d3d11_texture pointer: %p", output_d3d11);
-    blog(LOG_INFO, "  - output_d3d11_texture as ID3D11Resource: %p", output_d3d11_resource);
-    blog(LOG_INFO, "  - UAV resource == output texture resource: %s", 
-         (uav_resource == output_d3d11_resource) ? "YES" : "NO");
-    if (uav_resource) uav_resource->Release();
-    if (output_d3d11_resource) output_d3d11_resource->Release();
     
     // Update constant buffer for postprocess
     // TRT output is 1024x1024, we need to resample to W×H
@@ -1238,34 +1304,14 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
     // Dispatch compute shader
     uint32_t groups_x = (filter->width + 15) / 16;
     uint32_t groups_y = (filter->height + 15) / 16;
-    
-    // DEBUG: Log dispatch information
-    static uint64_t dispatch_frame_counter = 0;
-    dispatch_frame_counter++;
-    if (dispatch_frame_counter % 60 == 0 || dispatch_frame_counter == 1) {
-        blog(LOG_INFO, "[TRT Filter] POSTPROCESS DISPATCH DEBUG (frame %llu):", 
-             (unsigned long long)dispatch_frame_counter);
-        blog(LOG_INFO, "  - Shader pointer: %p (null=%s)", 
-             filter->postprocess_shader, 
-             filter->postprocess_shader ? "NO" : "YES");
-        blog(LOG_INFO, "  - Output size: %ux%u", filter->width, filter->height);
-        blog(LOG_INFO, "  - Thread groups: (%u, %u, 1)", groups_x, groups_y);
-        blog(LOG_INFO, "  - Output UAV texture pointer: %p", output_d3d11);
-        blog(LOG_INFO, "  - Output UAV view pointer: %p", output_uav);
-    }
-    
+
     // Create query BEFORE dispatch for proper synchronization
     ID3D11Query *pQuery = nullptr;
     D3D11_QUERY_DESC queryDesc = {};
     queryDesc.Query = D3D11_QUERY_EVENT;
     HRESULT query_hr = filter->d3d11_device->CreateQuery(&queryDesc, &pQuery);
-    
+
     filter->d3d11_context->Dispatch(groups_x, groups_y, 1);
-    
-    if (dispatch_frame_counter % 60 == 0 || dispatch_frame_counter == 1) {
-        blog(LOG_INFO, "[TRT Filter] POSTPROCESS DISPATCH COMPLETED (frame %llu)", 
-             (unsigned long long)dispatch_frame_counter);
-    }
     
     // Unbind resources FIRST (important for state transitions)
     filter->d3d11_context->CSSetShaderResources(0, 1, &null_srv);
@@ -1292,78 +1338,12 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
         }
         
         if (hr != S_OK) {
-            blog(LOG_WARNING, "[TRT Filter] Query wait failed or timed out (HR=0x%08X, attempts=%d)", hr, attempts);
-        } else {
-            // Always log, not just every 60 frames
-            if (dispatch_frame_counter % 60 == 0 || dispatch_frame_counter == 1) {
-                blog(LOG_INFO, "[TRT Filter] Query wait succeeded (attempts=%d, frame=%llu)", 
-                     attempts, (unsigned long long)dispatch_frame_counter);
-            }
-            
-            // Verify UAV was written by reading back a pixel (only on debug frames)
-            if (dispatch_frame_counter % 60 == 0 || dispatch_frame_counter == 1) {
-                // Create a staging texture to read back a pixel
-                D3D11_TEXTURE2D_DESC stagingDesc = {};
-                output_d3d11->GetDesc(&stagingDesc);
-                stagingDesc.Usage = D3D11_USAGE_STAGING;
-                stagingDesc.BindFlags = 0;
-                stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                
-                ID3D11Texture2D *stagingTex = nullptr;
-                HRESULT staging_hr = filter->d3d11_device->CreateTexture2D(&stagingDesc, nullptr, &stagingTex);
-                if (SUCCEEDED(staging_hr) && stagingTex) {
-                    filter->d3d11_context->CopyResource(stagingTex, output_d3d11);
-                    filter->d3d11_context->Flush();
-                    
-                    // Wait for copy to complete
-                    ID3D11Query *copyQuery = nullptr;
-                    D3D11_QUERY_DESC copyQueryDesc = {};
-                    copyQueryDesc.Query = D3D11_QUERY_EVENT;
-                    if (SUCCEEDED(filter->d3d11_device->CreateQuery(&copyQueryDesc, &copyQuery))) {
-                        filter->d3d11_context->End(copyQuery);
-                        filter->d3d11_context->Flush();
-                        BOOL copyData = FALSE;
-                        int copy_attempts = 0;
-                        while (filter->d3d11_context->GetData(copyQuery, &copyData, sizeof(BOOL), 0) == S_FALSE && copy_attempts < 1000) {
-                            Sleep(0);
-                            copy_attempts++;
-                        }
-                        copyQuery->Release();
-                    }
-                    
-                    D3D11_MAPPED_SUBRESOURCE mapped;
-                    if (SUCCEEDED(filter->d3d11_context->Map(stagingTex, 0, D3D11_MAP_READ, 0, &mapped))) {
-                        // Read first pixel (top-left)
-                        uint32_t *pixel = (uint32_t *)mapped.pData;
-                        uint8_t b = (*pixel) & 0xFF;
-                        uint8_t g = ((*pixel) >> 8) & 0xFF;
-                        uint8_t r = ((*pixel) >> 16) & 0xFF;
-                        uint8_t a = ((*pixel) >> 24) & 0xFF;
-                        
-                        blog(LOG_INFO, "[TRT Filter] UAV pixel readback (top-left): R=%d, G=%d, B=%d, A=%d (0x%08X)", 
-                             r, g, b, a, *pixel);
-                        
-                        // With DEBUG_POSTPROCESS=1, we expect magenta: B=255, G=0, R=255, A=255
-                        if (r == 255 && g == 0 && b == 255 && a == 255) {
-                            blog(LOG_INFO, "[TRT Filter] ✓ UAV contains magenta - shader is writing correctly!");
-                        } else {
-                            blog(LOG_WARNING, "[TRT Filter] ✗ UAV does NOT contain magenta - shader may not be writing! Expected (R=255, G=0, B=255, A=255)");
-                        }
-                        
-                        filter->d3d11_context->Unmap(stagingTex, 0);
-                    } else {
-                        blog(LOG_WARNING, "[TRT Filter] Failed to map staging texture for readback");
-                    }
-                    stagingTex->Release();
-                } else {
-                    blog(LOG_WARNING, "[TRT Filter] Failed to create staging texture for readback");
-                }
-            }
+            blog(LOG_WARNING, "[TRT Filter] Postprocess query wait failed or timed out (HR=0x%08X, attempts=%d)", hr, attempts);
         }
-        
+
         pQuery->Release();
     } else {
-        blog(LOG_WARNING, "[TRT Filter] Failed to create query for synchronization");
+        blog(LOG_WARNING, "[TRT Filter] Failed to create postprocess sync query");
     }
     
     // Additional resource state barrier using async query
@@ -1386,8 +1366,8 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
             async_attempts++;
         }
         
-        if (async_hr_wait != S_OK && (dispatch_frame_counter % 60 == 0 || dispatch_frame_counter == 1)) {
-            blog(LOG_WARNING, "[TRT Filter] Async query wait failed (HR=0x%08X, attempts=%d)", async_hr_wait, async_attempts);
+        if (async_hr_wait != S_OK) {
+            blog(LOG_WARNING, "[TRT Filter] Async barrier query wait failed (HR=0x%08X, attempts=%d)", async_hr_wait, async_attempts);
         }
         
         pAsyncQuery->Release();
@@ -1398,91 +1378,11 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
 
     // Copy D3D11 texture to gs_texture for rendering
     ID3D11Texture2D *gs_tex_d3d11 = (ID3D11Texture2D *)gs_texture_get_obj(filter->output_texture);
-    
-    // DEBUG: Resource binding validation - ALWAYS log to confirm texture relationship
-    static uint64_t render_frame_counter = 0;
-    static bool texture_relationship_logged = false;
-    render_frame_counter++;
-    
-    // Log on first frame and every 60 frames, or if relationship hasn't been confirmed yet
-    if (render_frame_counter == 1 || render_frame_counter % 60 == 0 || !texture_relationship_logged) {
-        blog(LOG_INFO, "[TRT Filter] RESOURCE BINDING DEBUG (frame %llu):", 
-             (unsigned long long)render_frame_counter);
-        blog(LOG_INFO, "  - Postprocess output texture (UAV target): %p", output_d3d11);
-        blog(LOG_INFO, "  - Final draw texture (gs_texture D3D11 obj): %p", gs_tex_d3d11);
-        blog(LOG_INFO, "  - Textures match: %s", 
-             (output_d3d11 == gs_tex_d3d11) ? "YES" : "NO");
-        
-        if (output_d3d11 == gs_tex_d3d11) {
-            blog(LOG_INFO, "  - ✓ Textures are SAME object - CopyResource is a no-op");
-            texture_relationship_logged = true;
-        } else {
-            blog(LOG_WARNING, "  - ✗ Textures are DIFFERENT objects - CopyResource will be used");
-            texture_relationship_logged = true;
-            
-            // Additional detail: compare texture descriptions
-            if (gs_tex_d3d11) {
-                D3D11_TEXTURE2D_DESC srcDesc = {}, dstDesc = {};
-                output_d3d11->GetDesc(&srcDesc);
-                gs_tex_d3d11->GetDesc(&dstDesc);
-                blog(LOG_INFO, "  - Source texture desc: %ux%u, format=%d, usage=%d, bindflags=0x%X",
-                     srcDesc.Width, srcDesc.Height, srcDesc.Format, srcDesc.Usage, srcDesc.BindFlags);
-                blog(LOG_INFO, "  - Dest texture desc: %ux%u, format=%d, usage=%d, bindflags=0x%X",
-                     dstDesc.Width, dstDesc.Height, dstDesc.Format, dstDesc.Usage, dstDesc.BindFlags);
-            }
-        }
-    }
-    
+
     if (gs_tex_d3d11) {
-        // Verify textures have same format/size before copy
-        if (render_frame_counter % 60 == 0 || render_frame_counter == 1) {
-            D3D11_TEXTURE2D_DESC srcDesc = {}, dstDesc = {};
-            output_d3d11->GetDesc(&srcDesc);
-            gs_tex_d3d11->GetDesc(&dstDesc);
-            blog(LOG_INFO, "[TRT Filter] Source texture: %ux%u, format=%d, mips=%u", 
-                 srcDesc.Width, srcDesc.Height, srcDesc.Format, srcDesc.MipLevels);
-            blog(LOG_INFO, "[TRT Filter] Dest texture: %ux%u, format=%d, mips=%u", 
-                 dstDesc.Width, dstDesc.Height, dstDesc.Format, dstDesc.MipLevels);
-            
-            if (srcDesc.Width != dstDesc.Width || srcDesc.Height != dstDesc.Height) {
-                blog(LOG_ERROR, "[TRT Filter] ERROR: Texture size mismatch! Copy may fail.");
-            }
-            if (srcDesc.Format != dstDesc.Format) {
-                blog(LOG_WARNING, "[TRT Filter] WARNING: Texture format mismatch (src=%d, dst=%d)", 
-                     srcDesc.Format, dstDesc.Format);
-            }
-        }
-        
-        // DEBUG 2: Log CopyResource src/dst pointers and descriptions
-        D3D11_TEXTURE2D_DESC copySrcDesc = {}, copyDstDesc = {};
-        output_d3d11->GetDesc(&copySrcDesc);
-        gs_tex_d3d11->GetDesc(&copyDstDesc);
-        blog(LOG_INFO, "[TRT Filter] DEBUG 2 - CopyResource Step:");
-        blog(LOG_INFO, "  - CopyResource src (output_d3d11): %p", output_d3d11);
-        blog(LOG_INFO, "    Desc: %ux%u, format=%d, bindflags=0x%X", 
-             copySrcDesc.Width, copySrcDesc.Height, copySrcDesc.Format, copySrcDesc.BindFlags);
-        blog(LOG_INFO, "  - CopyResource dst (gs_tex_d3d11): %p", gs_tex_d3d11);
-        blog(LOG_INFO, "    Desc: %ux%u, format=%d, bindflags=0x%X", 
-             copyDstDesc.Width, copyDstDesc.Height, copyDstDesc.Format, copyDstDesc.BindFlags);
-        blog(LOG_INFO, "  - Pointers match: %s", (output_d3d11 == gs_tex_d3d11) ? "YES" : "NO");
-        
         filter->d3d11_context->CopyResource(gs_tex_d3d11, output_d3d11);
-        
-        // Log confirmation on first frame
-        if (render_frame_counter == 1) {
-            blog(LOG_INFO, "[TRT Filter] CopyResource completed: %p <- %p", 
-                 gs_tex_d3d11, output_d3d11);
-            if (gs_tex_d3d11 == output_d3d11) {
-                blog(LOG_INFO, "[TRT Filter] NOTE: CopyResource was a no-op (same object)");
-            } else {
-                blog(LOG_INFO, "[TRT Filter] NOTE: CopyResource copied data between different objects");
-            }
-        } else if (render_frame_counter % 60 == 0) {
-            blog(LOG_INFO, "[TRT Filter] CopyResource completed: %p <- %p", 
-                 gs_tex_d3d11, output_d3d11);
-        }
-        
-        // CRITICAL: Wait for copy to complete before drawing
+
+        // Wait for copy to complete before drawing
         ID3D11Query *copyCompleteQuery = nullptr;
         D3D11_QUERY_DESC copyQueryDesc = {};
         copyQueryDesc.Query = D3D11_QUERY_EVENT;
@@ -1490,7 +1390,7 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
         if (SUCCEEDED(copyQuery_hr) && copyCompleteQuery) {
             filter->d3d11_context->End(copyCompleteQuery);
             filter->d3d11_context->Flush();
-            
+
             BOOL copyComplete = FALSE;
             int copy_wait_attempts = 0;
             const int max_copy_wait_attempts = 10000;
@@ -1499,305 +1399,114 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
                 Sleep(0);
                 copy_wait_attempts++;
             }
-            
-            if (copy_hr != S_OK && (render_frame_counter % 60 == 0 || render_frame_counter == 1)) {
+
+            if (copy_hr != S_OK) {
                 blog(LOG_WARNING, "[TRT Filter] Copy completion query wait failed (HR=0x%08X, attempts=%d)", copy_hr, copy_wait_attempts);
-            } else if (render_frame_counter % 60 == 0 || render_frame_counter == 1) {
-                blog(LOG_INFO, "[TRT Filter] Copy completion verified (attempts=%d)", copy_wait_attempts);
             }
-            
+
             copyCompleteQuery->Release();
         }
-        
-        // Verify copy worked by reading back from destination texture
-        if (render_frame_counter % 60 == 0 || render_frame_counter == 1) {
-            // Create staging texture to read back from destination
-            D3D11_TEXTURE2D_DESC stagingDesc = {};
-            gs_tex_d3d11->GetDesc(&stagingDesc);
-            stagingDesc.Usage = D3D11_USAGE_STAGING;
-            stagingDesc.BindFlags = 0;
-            stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            
-            ID3D11Texture2D *destStagingTex = nullptr;
-            HRESULT destStaging_hr = filter->d3d11_device->CreateTexture2D(&stagingDesc, nullptr, &destStagingTex);
-            if (SUCCEEDED(destStaging_hr) && destStagingTex) {
-                filter->d3d11_context->CopyResource(destStagingTex, gs_tex_d3d11);
-                
-                // Wait for copy to staging
-                ID3D11Query *destCopyQuery = nullptr;
-                D3D11_QUERY_DESC destCopyQueryDesc = {};
-                destCopyQueryDesc.Query = D3D11_QUERY_EVENT;
-                if (SUCCEEDED(filter->d3d11_device->CreateQuery(&destCopyQueryDesc, &destCopyQuery))) {
-                    filter->d3d11_context->End(destCopyQuery);
-                    filter->d3d11_context->Flush();
-                    BOOL destCopyData = FALSE;
-                    int dest_copy_attempts = 0;
-                    while (filter->d3d11_context->GetData(destCopyQuery, &destCopyData, sizeof(BOOL), 0) == S_FALSE && dest_copy_attempts < 1000) {
-                        Sleep(0);
-                        dest_copy_attempts++;
-                    }
-                    destCopyQuery->Release();
-                }
-                
-                D3D11_MAPPED_SUBRESOURCE destMapped;
-                if (SUCCEEDED(filter->d3d11_context->Map(destStagingTex, 0, D3D11_MAP_READ, 0, &destMapped))) {
-                    uint32_t *destPixel = (uint32_t *)destMapped.pData;
-                    uint8_t dest_b = (*destPixel) & 0xFF;
-                    uint8_t dest_g = ((*destPixel) >> 8) & 0xFF;
-                    uint8_t dest_r = ((*destPixel) >> 16) & 0xFF;
-                    uint8_t dest_a = ((*destPixel) >> 24) & 0xFF;
-                    
-                    blog(LOG_INFO, "[TRT Filter] Destination texture pixel readback (top-left): R=%d, G=%d, B=%d, A=%d (0x%08X)", 
-                         dest_r, dest_g, dest_b, dest_a, *destPixel);
-                    
-                    if (dest_r == 255 && dest_g == 0 && dest_b == 255 && dest_a == 255) {
-                        blog(LOG_INFO, "[TRT Filter] ✓ Copy succeeded - destination contains magenta!");
-                    } else {
-                        blog(LOG_WARNING, "[TRT Filter] ✗ Copy may have failed - destination does NOT contain magenta! Expected (R=255, G=0, B=255, A=255)");
-                    }
-                    
-                    filter->d3d11_context->Unmap(destStagingTex, 0);
-                } else {
-                    blog(LOG_WARNING, "[TRT Filter] Failed to map destination staging texture for readback");
-                }
-                destStagingTex->Release();
-            } else {
-                blog(LOG_WARNING, "[TRT Filter] Failed to create destination staging texture for readback");
-            }
-        }
-        
-        // Flush after copy to ensure it completes
+
         filter->d3d11_context->Flush();
     } else {
-        blog(LOG_ERROR, "[TRT Filter] ERROR: gs_texture_get_obj returned null!");
+        blog(LOG_ERROR, "[TRT Filter] gs_texture_get_obj returned null - cannot copy output texture");
     }
     
     // Step 7: Draw output texture
     bool begin_result = obs_source_process_filter_begin(filter->context, GS_BGRA_UNORM, OBS_ALLOW_DIRECT_RENDERING);
-    blog(LOG_INFO, "[TRT Filter] CANARY - obs_source_process_filter_begin() returned: %s", begin_result ? "true" : "false");
     if (!begin_result) {
-        blog(LOG_WARNING, "[TRT Filter] CANARY - Early return: obs_source_process_filter_begin() returned false");
+        blog(LOG_WARNING, "[TRT Filter] obs_source_process_filter_begin() returned false");
         return;
     }
-    
+
     gs_effect_t *default_effect = nullptr;
     gs_eparam_t *image_param = nullptr;
     const char *technique_name = nullptr;
-    
-    // Debug canary: solid color test
+
     if (filter->debug_force_solid_color) {
-        blog(LOG_INFO, "[TRT Filter] CANARY - Using solid magenta color (bypassing texture)");
         default_effect = obs_get_base_effect(OBS_EFFECT_SOLID);
-        
-        // Debug log effect info
-        debug_log_effect_info(default_effect, "OBS_EFFECT_SOLID");
-        
-        // Get technique name (don't assume "Draw")
-        technique_name = get_first_technique_name(default_effect, true);  // true = is_solid
+        technique_name = get_first_technique_name(default_effect, true);
         if (!technique_name) {
-            blog(LOG_ERROR, "[TRT Filter] CANARY - Failed to get technique name from OBS_EFFECT_SOLID");
+            blog(LOG_ERROR, "[TRT Filter] Failed to get technique name from OBS_EFFECT_SOLID");
             obs_source_process_filter_end(filter->context, default_effect, 0, 0);
             return;
         }
-        blog(LOG_INFO, "[TRT Filter] CANARY - Using technique: '%s'", technique_name);
-        
-        // Set color parameter (guard against NULL) - ONLY for OBS_EFFECT_SOLID
-        // Only set parameters that exist in the current effect
         gs_eparam_t *color_param = gs_effect_get_param_by_name(default_effect, "color");
-        if (color_param && default_effect) {
-            struct vec4 magenta = {1.0f, 0.0f, 1.0f, 1.0f}; // RGBA: magenta, fully opaque
+        if (color_param) {
+            struct vec4 magenta = {1.0f, 0.0f, 1.0f, 1.0f};
             gs_effect_set_vec4(color_param, &magenta);
-            blog(LOG_INFO, "[TRT Filter] CANARY - Set color parameter to magenta (effect=%p, param=%p)", default_effect, color_param);
         } else {
             static bool color_param_warned = false;
             if (!color_param_warned) {
-                blog(LOG_WARNING, "[TRT Filter] CANARY - Color parameter 'color' not found in OBS_EFFECT_SOLID (effect=%p, param=%p) - SKIPPED", default_effect, color_param);
+                blog(LOG_WARNING, "[TRT Filter] 'color' param not found in OBS_EFFECT_SOLID");
                 color_param_warned = true;
             }
         }
-        
-        // Explicitly ensure image_param is NULL in solid color mode (should already be, but be explicit)
         image_param = nullptr;
-        
-        // Force opaque for solid color canary
         filter->debug_force_opaque = true;
     } else {
         default_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
-        
-        // Debug log effect info
-        debug_log_effect_info(default_effect, "OBS_EFFECT_DEFAULT");
-        
-        // Get technique name (don't assume "Draw")
-        technique_name = get_first_technique_name(default_effect, false);  // false = is_solid
+        technique_name = get_first_technique_name(default_effect, false);
         if (!technique_name) {
-            blog(LOG_ERROR, "[TRT Filter] CANARY - Failed to get technique name from OBS_EFFECT_DEFAULT");
+            blog(LOG_ERROR, "[TRT Filter] Failed to get technique name from OBS_EFFECT_DEFAULT");
             obs_source_process_filter_end(filter->context, default_effect, 0, 0);
             return;
         }
-        blog(LOG_INFO, "[TRT Filter] CANARY - Using technique: '%s'", technique_name);
-        
-        // Get image parameter (guard against NULL) - ONLY for OBS_EFFECT_DEFAULT
         image_param = gs_effect_get_param_by_name(default_effect, "image");
         if (!image_param) {
             static bool image_param_warned = false;
             if (!image_param_warned) {
-                blog(LOG_WARNING, "[TRT Filter] CANARY - Image parameter 'image' not found in OBS_EFFECT_DEFAULT - SKIPPED");
+                blog(LOG_WARNING, "[TRT Filter] 'image' param not found in OBS_EFFECT_DEFAULT");
                 image_param_warned = true;
             }
         }
-        
-        // Explicitly ensure we don't try to set color in normal mode
-        // (color_param is not in scope here, which is correct)
     }
-    
-    // DEBUG 3: Log texture being drawn and verify it's the output texture
-    ID3D11Texture2D *draw_texture_d3d11 = (ID3D11Texture2D *)gs_texture_get_obj(filter->output_texture);
-    const char *source_name = obs_source_get_name(filter->context);
-    blog(LOG_INFO, "[TRT Filter] DEBUG 3 - Pre-Draw Texture Verification:");
-    blog(LOG_INFO, "  - OBS source context: %p (name: %s)", filter->context, source_name ? source_name : "(null)");
-    blog(LOG_INFO, "  - gs_texture_t* being drawn (filter->output_texture): %p", filter->output_texture);
-    blog(LOG_INFO, "  - Underlying ID3D11Texture2D* from gs_texture_get_obj(): %p", draw_texture_d3d11);
-    blog(LOG_INFO, "  - CopyResource destination (gs_tex_d3d11): %p", gs_tex_d3d11);
-    blog(LOG_INFO, "  - Draw texture D3D11 == CopyResource destination: %s", 
-         (draw_texture_d3d11 == gs_tex_d3d11) ? "YES" : "NO");
-    
-    if (render_frame_counter % 60 == 0 || render_frame_counter == 1) {
-        blog(LOG_INFO, "[TRT Filter] Drawing texture: gs_texture_t* = %p", filter->output_texture);
-        
-        // CRITICAL: Verify texture still contains magenta right before drawing
-        ID3D11Texture2D *verify_tex_d3d11 = (ID3D11Texture2D *)gs_texture_get_obj(filter->output_texture);
-        if (verify_tex_d3d11) {
-            D3D11_TEXTURE2D_DESC verifyDesc = {};
-            verify_tex_d3d11->GetDesc(&verifyDesc);
-            verifyDesc.Usage = D3D11_USAGE_STAGING;
-            verifyDesc.BindFlags = 0;
-            verifyDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            
-            ID3D11Texture2D *verifyStaging = nullptr;
-            if (SUCCEEDED(filter->d3d11_device->CreateTexture2D(&verifyDesc, nullptr, &verifyStaging))) {
-                filter->d3d11_context->CopyResource(verifyStaging, verify_tex_d3d11);
-                
-                // Quick barrier
-                ID3D11Query *verifyQuery = nullptr;
-                D3D11_QUERY_DESC verifyQueryDesc = {};
-                verifyQueryDesc.Query = D3D11_QUERY_EVENT;
-                if (SUCCEEDED(filter->d3d11_device->CreateQuery(&verifyQueryDesc, &verifyQuery))) {
-                    filter->d3d11_context->End(verifyQuery);
-                    filter->d3d11_context->Flush();
-                    BOOL verifyData = FALSE;
-                    int verify_attempts = 0;
-                    while (filter->d3d11_context->GetData(verifyQuery, &verifyData, sizeof(BOOL), 0) == S_FALSE && verify_attempts < 100) {
-                        Sleep(0);
-                        verify_attempts++;
-                    }
-                    verifyQuery->Release();
-                }
-                
-                D3D11_MAPPED_SUBRESOURCE verifyMapped;
-                if (SUCCEEDED(filter->d3d11_context->Map(verifyStaging, 0, D3D11_MAP_READ, 0, &verifyMapped))) {
-                    uint32_t *verifyPixel = (uint32_t *)verifyMapped.pData;
-                    uint8_t v_r = ((*verifyPixel) >> 16) & 0xFF;
-                    uint8_t v_g = ((*verifyPixel) >> 8) & 0xFF;
-                    uint8_t v_b = (*verifyPixel) & 0xFF;
-                    uint8_t v_a = ((*verifyPixel) >> 24) & 0xFF;
-                    
-                    blog(LOG_INFO, "[TRT Filter] Pre-draw texture verification: R=%d, G=%d, B=%d, A=%d", v_r, v_g, v_b, v_a);
-                    
-                    if (v_r == 255 && v_g == 0 && v_b == 255 && v_a == 255) {
-                        blog(LOG_INFO, "[TRT Filter] ✓ Texture still contains magenta before draw!");
-                    } else {
-                        blog(LOG_ERROR, "[TRT Filter] ✗ Texture lost magenta before draw! This indicates OBS or something else overwrote it.");
-                    }
-                    
-                    filter->d3d11_context->Unmap(verifyStaging, 0);
-                }
-                verifyStaging->Release();
-            }
-        }
-    }
-    
+
     // Set texture via effect parameter (unless using solid color)
     if (!filter->debug_force_solid_color) {
-        // DEBUG 4: Verify image_param is set to output_texture, not input_texture
-        gs_texture_t *input_texture_for_verify = gs_texrender_get_texture(render_unorm);
-        blog(LOG_INFO, "[TRT Filter] DEBUG 4 - Effect Parameter Binding:");
-        blog(LOG_INFO, "  - image_param pointer: %p", image_param);
-        blog(LOG_INFO, "  - Setting image_param to filter->output_texture: %p", filter->output_texture);
-        blog(LOG_INFO, "  - Input texture (for comparison): %p", input_texture_for_verify);
-        blog(LOG_INFO, "  - Verifying we are NOT setting input_texture: %s", 
-             (filter->output_texture == input_texture_for_verify) ? "ERROR - WRONG TEXTURE!" : "OK - correct texture");
-        
-        // Guard: Only set texture if parameter exists AND we're in normal mode (not solid color)
-        // This should already be guarded by the outer if, but double-check
-        if (image_param && default_effect && !filter->debug_force_solid_color) {
+        if (image_param) {
             gs_effect_set_texture(image_param, filter->output_texture);
-            blog(LOG_INFO, "  - ✓ gs_effect_set_texture() called with filter->output_texture (%p) (effect=%p, param=%p)", 
-                 filter->output_texture, default_effect, image_param);
         } else {
-            if (!image_param) {
-                static bool image_set_warned = false;
-                if (!image_set_warned) {
-                    blog(LOG_WARNING, "[TRT Filter] CANARY - image_param is NULL, skipping gs_effect_set_texture() - SKIPPED (effect=%p)", default_effect);
-                    image_set_warned = true;
-                }
+            static bool image_set_warned = false;
+            if (!image_set_warned) {
+                blog(LOG_WARNING, "[TRT Filter] image_param is NULL, skipping gs_effect_set_texture()");
+                image_set_warned = true;
             }
-            if (filter->debug_force_solid_color) {
-                blog(LOG_INFO, "[TRT Filter] CANARY - In solid color mode, skipping image parameter set (correct behavior)");
-            }
-        }
-        
-        // Checkerboard overlay (if enabled)
-        if (filter->debug_checkerboard_overlay) {
-            blog(LOG_INFO, "[TRT Filter] CANARY - Applying checkerboard overlay");
-            // Note: Checkerboard would require a custom shader or effect
-            // For now, we'll just log that it's enabled
-            // A full implementation would need a compute shader or pixel shader to draw the pattern
         }
     }
-    
+
     // Blend state setup
     gs_blend_state_push();
     if (filter->debug_force_opaque) {
-        blog(LOG_INFO, "[TRT Filter] CANARY - Using opaque blend state (no transparency)");
-        gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO); // Opaque: src * 1 + dst * 0
+        gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
     } else {
         gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
     }
-    
-    // Draw - Use the queried technique name, not hardcoded "Draw"
+
     if (!technique_name) {
-        blog(LOG_ERROR, "[TRT Filter] CANARY - ERROR: technique_name is NULL, cannot draw!");
+        blog(LOG_ERROR, "[TRT Filter] technique_name is NULL, cannot draw");
         gs_blend_state_pop();
         obs_source_process_filter_end(filter->context, default_effect, 0, 0);
         return;
     }
-    
-    blog(LOG_INFO, "[TRT Filter] CANARY - About to call gs_effect_loop() with technique '%s'", technique_name);
+
     int loop_count = 0;
     while (gs_effect_loop(default_effect, technique_name)) {
         loop_count++;
-        blog(LOG_INFO, "[TRT Filter] CANARY - gs_effect_loop() iteration %d, about to call gs_draw_sprite()", loop_count);
-        // Pass NULL to use texture from effect parameter (like grayscale filter example)
         gs_draw_sprite(NULL, 0, filter->width, filter->height);
-        blog(LOG_INFO, "[TRT Filter] CANARY - gs_draw_sprite() completed");
     }
-    blog(LOG_INFO, "[TRT Filter] CANARY - gs_effect_loop() completed, iterations: %d", loop_count);
     if (loop_count == 0) {
-        blog(LOG_WARNING, "[TRT Filter] CANARY - WARNING: gs_effect_loop() returned 0 iterations with technique '%s'!", technique_name);
-        blog(LOG_WARNING, "[TRT Filter] CANARY - Check the effect debug log above for available techniques");
+        blog(LOG_WARNING, "[TRT Filter] gs_effect_loop() returned 0 iterations with technique '%s'", technique_name);
     }
-    
+
     gs_blend_state_pop();
 
-    // Clear texture parameter before ending to prevent OBS from trying to reset non-existent params
-    // OBS_EFFECT_SOLID doesn't have "image" param, so OBS might try to reset it and fail
     if (!filter->debug_force_solid_color && image_param) {
         gs_effect_set_texture(image_param, nullptr);
     }
-    
-    blog(LOG_INFO, "[TRT Filter] CANARY - About to call obs_source_process_filter_end()");
-    obs_source_process_filter_end(filter->context, default_effect, 0, 0);
-    blog(LOG_INFO, "[TRT Filter] CANARY - obs_source_process_filter_end() completed");
+
+    // NOTE: Do NOT call obs_source_process_filter_end here — it redraws the upstream source
+    // over our already-drawn output, completely overwriting the TRT-processed frame.
     
     // Step 8: Metrics pass (if enabled and interval reached)
     if (filter->metrics_enabled && filter->metrics_shader) {
