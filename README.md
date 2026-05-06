@@ -2,7 +2,7 @@
 
 ## Overview
 
-This implementation integrates TensorRT inference into an OBS filter plugin using D3D11 HLSL compute shaders for all pre/postprocessing. The filter processes video frames in real-time using the NVIDIA VideoFX pattern.
+This implementation integrates TensorRT inference into an OBS filter plugin using D3D11 HLSL compute shaders for all pre/postprocessing. The filter processes video frames in real-time using the NVIDIA VideoFX pattern. Here is a demo video: https://youtu.be/E74Dqn3iE-U
 
 ## Architecture
 
