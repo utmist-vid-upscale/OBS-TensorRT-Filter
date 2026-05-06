@@ -570,17 +570,18 @@ static bool create_metrics_resources(struct trt_filter_data *filter)
     
     // Note: We sample directly from original textures, so no need for downsampled textures
     
-    // Create structured buffer for group sums (max groups: 8x8 = 64 for 128x128)
+    // GPU-side group sums buffer: shader writes per-group float4 here.
+    // Max 64 groups (8×8 dispatch for 128×128 sample size) × 16 bytes = 1024 bytes.
     D3D11_BUFFER_DESC buffer_desc = {};
     buffer_desc.Usage = D3D11_USAGE_DEFAULT;
     buffer_desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
     buffer_desc.CPUAccessFlags = 0;
     buffer_desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-    buffer_desc.StructureByteStride = sizeof(float) * 2;  // float2 per group
-    buffer_desc.ByteWidth = 64 * buffer_desc.StructureByteStride;  // Max 64 groups
-    
+    buffer_desc.StructureByteStride = sizeof(float) * 4;  // float4 per group
+    buffer_desc.ByteWidth = 64 * buffer_desc.StructureByteStride;  // 1024 bytes
+
     hr = device->CreateBuffer(&buffer_desc, nullptr, &filter->metrics_staging_buffer);
-    D3D11_CHECK(hr, "Failed to create metrics staging buffer");
+    D3D11_CHECK(hr, "Failed to create metrics GPU group sums buffer");
     
     // Note: We'll create a separate staging buffer for readback when needed
     // For now, we'll use CopyResource to a staging buffer created on-demand
@@ -1137,13 +1138,13 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
     
     // Preprocess resize policy: Centered crop/resize from W×H → 256×256
     // This maintains aspect ratio by scaling to fit the smaller dimension, then cropping the larger dimension
-    float scale_x = (float)filter->width / 256.0f;
-    float scale_y = (float)filter->height / 256.0f;
-    float scale = (scale_x > scale_y) ? scale_x : scale_y;  // Use larger scale to ensure coverage
-    constants.scale[0] = scale;
-    constants.scale[1] = scale;
-    constants.offset[0] = (filter->width - 256.0f * scale) * 0.5f;
-    constants.offset[1] = (filter->height - 256.0f * scale) * 0.5f;
+    // Independent per-axis scale: maps the full W×H source to the 256×256 input without cropping.
+    // The postprocess does the inverse (1024×1024 → W×H with independent axes), so aspect ratio
+    // is preserved end-to-end even though the intermediate 256×256 tensor is squashed.
+    constants.scale[0] = (float)filter->width  / 256.0f;
+    constants.scale[1] = (float)filter->height / 256.0f;
+    constants.offset[0] = 0.0f;
+    constants.offset[1] = 0.0f;
     
     D3D11_MAPPED_SUBRESOURCE mapped;
     filter->d3d11_context->Map(filter->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -1535,21 +1536,33 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
                 metricsQuery->Release();
             }
             
-            // Get SRVs for input and output textures
-            ID3D11ShaderResourceView *input_srv_for_metrics = nullptr;
+            // Get SRVs for input and output textures.
+            // Use GetDesc() for the input SRV format — same hazard fix as preprocess.
+            ID3D11ShaderResourceView *input_srv_for_metrics  = nullptr;
             ID3D11ShaderResourceView *output_srv_for_metrics = nullptr;
-            
-            D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-            srv_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-            srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-            srv_desc.Texture2D.MipLevels = 1;
-            srv_desc.Texture2D.MostDetailedMip = 0;
-            
-            ID3D11Texture2D *input_d3d11_for_metrics = (ID3D11Texture2D *)gs_texture_get_obj(input_texture);
-            filter->d3d11_device->CreateShaderResourceView(input_d3d11_for_metrics, &srv_desc, &input_srv_for_metrics);
-            
+
+            ID3D11Texture2D *input_d3d11_for_metrics  = (ID3D11Texture2D *)gs_texture_get_obj(input_texture);
             ID3D11Texture2D *output_d3d11_for_metrics = filter->output_d3d11_texture;
-            filter->d3d11_device->CreateShaderResourceView(output_d3d11_for_metrics, &srv_desc, &output_srv_for_metrics);
+
+            if (input_d3d11_for_metrics) {
+                D3D11_TEXTURE2D_DESC in_desc = {};
+                input_d3d11_for_metrics->GetDesc(&in_desc);
+                D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+                srv_desc.Format = in_desc.Format;
+                srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                srv_desc.Texture2D.MipLevels = 1;
+                srv_desc.Texture2D.MostDetailedMip = 0;
+                filter->d3d11_device->CreateShaderResourceView(input_d3d11_for_metrics, &srv_desc, &input_srv_for_metrics);
+            }
+
+            {
+                D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+                srv_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;  // output_d3d11_texture is always UNORM
+                srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                srv_desc.Texture2D.MipLevels = 1;
+                srv_desc.Texture2D.MostDetailedMip = 0;
+                filter->d3d11_device->CreateShaderResourceView(output_d3d11_for_metrics, &srv_desc, &output_srv_for_metrics);
+            }
             
             // Create UAV for group sums buffer
             D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
@@ -1583,6 +1596,9 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
             memcpy(mapped.pData, &metrics_constants, sizeof(metrics_constants));
             filter->d3d11_context->Unmap(filter->metrics_constant_buffer, 0);
             
+            // Clear OM RT bindings to prevent D3D11 hazard detection from nulling CS SRVs.
+            filter->d3d11_context->OMSetRenderTargets(0, nullptr, nullptr);
+
             // Dispatch metrics shader
             filter->d3d11_context->CSSetShader(filter->metrics_shader, nullptr, 0);
             filter->d3d11_context->CSSetConstantBuffers(0, 1, &filter->metrics_constant_buffer);
@@ -1601,57 +1617,60 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
             filter->d3d11_context->CSSetShaderResources(1, 1, &null_srv);
             filter->d3d11_context->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
             
-            // Create staging buffer for readback
+            // Staging buffer for CPU readback — must exactly match GPU buffer description
+            // (same MiscFlags, StructureByteStride, ByteWidth) for CopyResource to succeed.
             D3D11_BUFFER_DESC staging_desc = {};
-            staging_desc.Usage = D3D11_USAGE_STAGING;
-            staging_desc.BindFlags = 0;
-            staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            staging_desc.MiscFlags = 0;
-            staging_desc.ByteWidth = num_groups * sizeof(float) * 2;
-            
+            staging_desc.Usage             = D3D11_USAGE_STAGING;
+            staging_desc.BindFlags         = 0;
+            staging_desc.CPUAccessFlags    = D3D11_CPU_ACCESS_READ;
+            staging_desc.MiscFlags         = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+            staging_desc.StructureByteStride = sizeof(float) * 4;  // float4 per group
+            staging_desc.ByteWidth         = 64 * sizeof(float) * 4;  // 1024 bytes
+
             ID3D11Buffer *staging_buffer = nullptr;
             filter->d3d11_device->CreateBuffer(&staging_desc, nullptr, &staging_buffer);
-            
-            // Copy to staging
+
             filter->d3d11_context->CopyResource(staging_buffer, filter->metrics_staging_buffer);
-            
-            // Read back
+
             D3D11_MAPPED_SUBRESOURCE mapped_staging;
             filter->d3d11_context->Map(staging_buffer, 0, D3D11_MAP_READ, 0, &mapped_staging);
-            
-            // Read back group sums (each element is float2: [mae_sum, mse_sum])
-            // HLSL float2 is two consecutive floats
-            float *group_sums = (float*)mapped_staging.pData;
-            float mae_sum = 0.0f;
-            float mse_sum = 0.0f;
-            
+
+            // Accumulate per-group float4: (out_lap, in_lap, out_lum, in_lum)
+            const float *data = (const float *)mapped_staging.pData;
+            float sum_out_lap = 0.0f, sum_in_lap = 0.0f;
+            float sum_out_lum = 0.0f, sum_in_lum = 0.0f;
             for (uint32_t i = 0; i < num_groups; i++) {
-                mae_sum += group_sums[i * 2 + 0];  // x component (mae)
-                mse_sum += group_sums[i * 2 + 1];  // y component (mse)
+                sum_out_lap += data[i * 4 + 0];
+                sum_in_lap  += data[i * 4 + 1];
+                sum_out_lum += data[i * 4 + 2];
+                sum_in_lum  += data[i * 4 + 3];
             }
-            
+
             filter->d3d11_context->Unmap(staging_buffer, 0);
             staging_buffer->Release();
-            
+
             // Compute final metrics
-            uint32_t total_pixels = filter->metrics_sample_size * filter->metrics_sample_size;
-            float mae = mae_sum / (float)total_pixels;
-            float mse = mse_sum / (float)total_pixels;
-            
-            // Compute PSNR (guard against zero MSE)
-            float psnr = 0.0f;
-            const float epsilon = 1e-10f;
-            if (mse > epsilon) {
-                psnr = 10.0f * log10f(1.0f / mse);
-            } else {
-                psnr = 100.0f;  // Perfect match
-            }
-            
-            // Log metrics
-            blog(LOG_INFO, "[TRT Filter] Metrics (frame %llu): MAE=%.6f, MSE=%.6f, PSNR=%.2f dB, frame=%ux%u, sample=%ux%u",
+            const float N = (float)(filter->metrics_sample_size * filter->metrics_sample_size);
+            float out_sharpness   = sum_out_lap / N;
+            float in_sharpness    = sum_in_lap  / N;
+            float sharpness_delta = out_sharpness - in_sharpness;
+            float out_mean_lum    = sum_out_lum  / N;
+
+            // Temporal flicker: frame-to-frame change in output mean luminance.
+            // Large values on a static scene indicate SR flickering artifacts.
+            static float s_prev_out_lum = 0.0f;
+            static bool  s_has_prev_lum = false;
+            float flicker = s_has_prev_lum ? fabsf(out_mean_lum - s_prev_out_lum) : 0.0f;
+            s_prev_out_lum = out_mean_lum;
+            s_has_prev_lum = true;
+
+            blog(LOG_INFO,
+                 "[TRT Filter] Metrics (frame %llu): "
+                 "out_sharp=%.5f  in_sharp=%.5f  sharp_delta=%+.5f  "
+                 "out_lum=%.4f  flicker=%.5f  sample=%ux%u",
                  (unsigned long long)filter->inference_frame_count,
-                 mae, mse, psnr,
-                 filter->width, filter->height,
+                 out_sharpness, in_sharpness, sharpness_delta,
+                 out_mean_lum, flicker,
                  filter->metrics_sample_size, filter->metrics_sample_size);
             
             // Cleanup

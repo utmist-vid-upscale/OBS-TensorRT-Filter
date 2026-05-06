@@ -33,6 +33,11 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     float2 texCoord = uv / float2(InputSize);
     float3 rgb      = InputTexture.SampleLevel(LinearSampler, texCoord, 0.0).bgr;
 
+    // OBS renders into GS_CS_SRGB texrender but stores in UNORM (no _SRGB format),
+    // so sampled values are linear-light. RealESRGAN expects sRGB-encoded [0,1].
+    // Apply approximate linear→sRGB to match model training data.
+    rgb = pow(saturate(rgb), 1.0 / 2.2);
+
     // NCHW: R plane, G plane, B plane — each plane is channelSize uint32 (float) elements
     OutputBuffer[0u * channelSize + pixelIndex] = asuint(rgb.r);
     OutputBuffer[1u * channelSize + pixelIndex] = asuint(rgb.g);
