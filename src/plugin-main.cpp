@@ -30,7 +30,7 @@ struct trt_filter_data {
     // Graphics resources
     gs_texrender_t *render_unorm;
     gs_texture_t *output_texture;
-    ID3D11Texture2D *output_d3d11_texture; //D3D11 texture with UAV support
+    ID3D11Texture2D *output_d3d11_texture;
     
     // Dimensions
     uint32_t width;
@@ -234,7 +234,7 @@ static bool create_graphics_resources(struct trt_filter_data *filter)
         filter->output_d3d11_texture->Release();
         filter->output_d3d11_texture = nullptr;
     }
-    
+
     // Create texrender for input (BGRA_UNORM, SRGB)
     filter->render_unorm = gs_texrender_create(GS_BGRA_UNORM, GS_ZS_NONE);
     if (!filter->render_unorm) {
@@ -289,7 +289,7 @@ static bool create_graphics_resources(struct trt_filter_data *filter)
         filter->render_unorm = nullptr;
         return false;
     }
-    
+
     return true;
 }
 
@@ -725,8 +725,9 @@ static void trt_filter_destroy(void *data)
     }
     if (filter->output_d3d11_texture) {
         filter->output_d3d11_texture->Release();
+        filter->output_d3d11_texture = nullptr;
     }
-    
+
     obs_leave_graphics();
     
     bfree(filter);
@@ -1145,7 +1146,7 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
     constants.scale[1] = (float)filter->height / 256.0f;
     constants.offset[0] = 0.0f;
     constants.offset[1] = 0.0f;
-    
+
     D3D11_MAPPED_SUBRESOURCE mapped;
     filter->d3d11_context->Map(filter->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
     memcpy(mapped.pData, &constants, sizeof(constants));
@@ -1213,18 +1214,6 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
     filter->cuda_trt_input_ptr = d_input_ptr;
     filter->cuda_trt_output_ptr = d_output_ptr;
 
-    // Buffer probe: log first 8 floats at frame 1 and every 120 frames
-    static uint64_t probe_frame = 0;
-    probe_frame++;
-    bool do_probe = (probe_frame == 1 || probe_frame % 120 == 0);
-    if (do_probe) {
-        float in_vals[8] = {};
-        cudaMemcpy(in_vals, d_input_ptr, 8 * sizeof(float), cudaMemcpyDeviceToHost);
-        blog(LOG_INFO, "[TRT Filter] TRT input[0..7]: %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f",
-             in_vals[0], in_vals[1], in_vals[2], in_vals[3],
-             in_vals[4], in_vals[5], in_vals[6], in_vals[7]);
-    }
-
     // Step 4: Run TensorRT inference
     filter->inference_frame_count++;
 
@@ -1251,28 +1240,17 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
     // Step 5: Synchronize CUDA -> D3D11
     CUDA_CHECK_VOID(cudaStreamSynchronize(filter->cuda_stream));
 
-    if (do_probe) {
-        float out_vals[8] = {};
-        cudaMemcpy(out_vals, d_output_ptr, 8 * sizeof(float), cudaMemcpyDeviceToHost);
-        blog(LOG_INFO, "[TRT Filter] TRT output[0..7]: %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f",
-             out_vals[0], out_vals[1], out_vals[2], out_vals[3],
-             out_vals[4], out_vals[5], out_vals[6], out_vals[7]);
-    }
-
     // Unmap CUDA resources
     CUDA_CHECK_VOID(cudaGraphicsUnmapResources(2, resources, filter->cuda_stream));
     
-    // Step 6: Postprocess with compute shader (FP16 NCHW -> BGRA)
-    // Use the D3D11 texture with UAV support
+    // Step 6: Postprocess with compute shader (FP32 NCHW -> BGRA)
     ID3D11Texture2D *output_d3d11 = filter->output_d3d11_texture;
-    
-    // Create UAV for output texture
+
     ID3D11UnorderedAccessView *output_uav = nullptr;
     D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
     uav_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     uav_desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
     uav_desc.Texture2D.MipSlice = 0;
-    
     HRESULT hr = filter->d3d11_device->CreateUnorderedAccessView(output_d3d11, &uav_desc, &output_uav);
     if (FAILED(hr)) {
         blog(LOG_ERROR, "[TRT Filter] Failed to create output UAV (HR=0x%08X)", hr);
@@ -1291,7 +1269,7 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
     post_constants.output_size[1] = filter->height;
     post_constants.tensor_size[0] = 1024;
     post_constants.tensor_size[1] = 1024;
-    
+
     filter->d3d11_context->Map(filter->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
     memcpy(mapped.pData, &post_constants, sizeof(post_constants));
     filter->d3d11_context->Unmap(filter->constant_buffer, 0);
@@ -1306,109 +1284,19 @@ static void trt_filter_render(void *data, gs_effect_t *effect)
     uint32_t groups_x = (filter->width + 15) / 16;
     uint32_t groups_y = (filter->height + 15) / 16;
 
-    // Create query BEFORE dispatch for proper synchronization
-    ID3D11Query *pQuery = nullptr;
-    D3D11_QUERY_DESC queryDesc = {};
-    queryDesc.Query = D3D11_QUERY_EVENT;
-    HRESULT query_hr = filter->d3d11_device->CreateQuery(&queryDesc, &pQuery);
-
     filter->d3d11_context->Dispatch(groups_x, groups_y, 1);
-    
-    // Unbind resources FIRST (important for state transitions)
+
+    // Unbind — D3D11 immediate context serializes Dispatch → CopyResource → draw in
+    // submission order. No explicit query/flush barrier needed between these operations.
     filter->d3d11_context->CSSetShaderResources(0, 1, &null_srv);
     filter->d3d11_context->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
-    
-    if (output_uav) {
-        output_uav->Release();
-    }
-    
-    // Barrier: Ensure compute shader completes before copying
-    // End query after unbinding UAVs and wait for GPU completion
-    if (SUCCEEDED(query_hr) && pQuery) {
-        filter->d3d11_context->End(pQuery);
-        filter->d3d11_context->Flush();
-        
-        // Wait with timeout to avoid infinite loop
-        BOOL queryData = FALSE;
-        int attempts = 0;
-        const int max_attempts = 10000;
-        HRESULT hr = S_FALSE;
-        while ((hr = filter->d3d11_context->GetData(pQuery, &queryData, sizeof(BOOL), 0)) == S_FALSE && attempts < max_attempts) {
-            Sleep(0);  // Yield to other threads
-            attempts++;
-        }
-        
-        if (hr != S_OK) {
-            blog(LOG_WARNING, "[TRT Filter] Postprocess query wait failed or timed out (HR=0x%08X, attempts=%d)", hr, attempts);
-        }
 
-        pQuery->Release();
-    } else {
-        blog(LOG_WARNING, "[TRT Filter] Failed to create postprocess sync query");
-    }
-    
-    // Additional resource state barrier using async query
-    ID3D11Query *pAsyncQuery = nullptr;
-    D3D11_QUERY_DESC asyncQueryDesc = {};
-    asyncQueryDesc.Query = D3D11_QUERY_EVENT;
-    HRESULT async_hr = filter->d3d11_device->CreateQuery(&asyncQueryDesc, &pAsyncQuery);
-    
-    if (SUCCEEDED(async_hr) && pAsyncQuery) {
-        filter->d3d11_context->End(pAsyncQuery);
-        filter->d3d11_context->Flush();
-        
-        // Wait for all previous GPU work to complete
-        BOOL asyncData = FALSE;
-        int async_attempts = 0;
-        const int max_async_attempts = 10000;
-        HRESULT async_hr_wait = S_FALSE;
-        while ((async_hr_wait = filter->d3d11_context->GetData(pAsyncQuery, &asyncData, sizeof(BOOL), 0)) == S_FALSE && async_attempts < max_async_attempts) {
-            Sleep(0);  // Busy wait with yield
-            async_attempts++;
-        }
-        
-        if (async_hr_wait != S_OK) {
-            blog(LOG_WARNING, "[TRT Filter] Async barrier query wait failed (HR=0x%08X, attempts=%d)", async_hr_wait, async_attempts);
-        }
-        
-        pAsyncQuery->Release();
-    }
-    
-    // Final flush to ensure all commands are submitted
-    filter->d3d11_context->Flush();
+    if (output_uav) output_uav->Release();
 
-    // Copy D3D11 texture to gs_texture for rendering
+    // Copy postprocess output to OBS gs_texture for rendering
     ID3D11Texture2D *gs_tex_d3d11 = (ID3D11Texture2D *)gs_texture_get_obj(filter->output_texture);
-
     if (gs_tex_d3d11) {
         filter->d3d11_context->CopyResource(gs_tex_d3d11, output_d3d11);
-
-        // Wait for copy to complete before drawing
-        ID3D11Query *copyCompleteQuery = nullptr;
-        D3D11_QUERY_DESC copyQueryDesc = {};
-        copyQueryDesc.Query = D3D11_QUERY_EVENT;
-        HRESULT copyQuery_hr = filter->d3d11_device->CreateQuery(&copyQueryDesc, &copyCompleteQuery);
-        if (SUCCEEDED(copyQuery_hr) && copyCompleteQuery) {
-            filter->d3d11_context->End(copyCompleteQuery);
-            filter->d3d11_context->Flush();
-
-            BOOL copyComplete = FALSE;
-            int copy_wait_attempts = 0;
-            const int max_copy_wait_attempts = 10000;
-            HRESULT copy_hr = S_FALSE;
-            while ((copy_hr = filter->d3d11_context->GetData(copyCompleteQuery, &copyComplete, sizeof(BOOL), 0)) == S_FALSE && copy_wait_attempts < max_copy_wait_attempts) {
-                Sleep(0);
-                copy_wait_attempts++;
-            }
-
-            if (copy_hr != S_OK) {
-                blog(LOG_WARNING, "[TRT Filter] Copy completion query wait failed (HR=0x%08X, attempts=%d)", copy_hr, copy_wait_attempts);
-            }
-
-            copyCompleteQuery->Release();
-        }
-
-        filter->d3d11_context->Flush();
     } else {
         blog(LOG_ERROR, "[TRT Filter] gs_texture_get_obj returned null - cannot copy output texture");
     }

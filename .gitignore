@@ -7,6 +7,7 @@
 !/cmake
 !/data
 !/src
+!/docs
 !.clang-format
 !.gersemirc
 !.gitignore
@@ -17,6 +18,7 @@
 !README.md
 !PIPELINE_FIXES.md
 !QUICK_DEBUG_NOTES.md
+!CLAUDE.md
 
 # Exclude lock files
 *.lock.json
