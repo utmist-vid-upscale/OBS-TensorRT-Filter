@@ -1,6 +1,6 @@
 # OBS TensorRT Super-Resolution Filter
 
-An OBS Studio video filter plugin that performs real-time GPU super-resolution using NVIDIA TensorRT. Each captured frame is preprocessed with a D3D11 compute shader, upscaled via TensorRT inference on a CUDA stream, and postprocessed back into the OBS rendering pipeline.
+An OBS Studio video filter plugin that performs real-time GPU super-resolution using NVIDIA TensorRT. Each captured frame is preprocessed with a D3D11 compute shader, upscaled via TensorRT inference on a CUDA stream, and postprocessed back into the OBS rendering pipeline. Here is a demo video: https://youtu.be/E74Dqn3iE-U
 
 **Current status:** Upscale is visually working end-to-end. Output geometry and brightness are correct. See [Known Issues](#known-issues--next-steps) for remaining work.
 
@@ -78,6 +78,6 @@ cmake --install build_x64 --config RelWithDebInfo --prefix "%ProgramData%\obs-st
 ## Further Reading
 
 - [`docs/PIPELINE_OVERVIEW.md`](docs/PIPELINE_OVERVIEW.md) — full technical pipeline, tensor formats, sync requirements, pitfalls
-- [`PIPELINE_FIXES.md`](PIPELINE_FIXES.md) — postmortem for the four major bugs fixed
-- [`QUICK_DEBUG_NOTES.md`](QUICK_DEBUG_NOTES.md) — quick bug/fix reference table
+- [`docs/PIPELINE_FIXES.md`](PIPELINE_FIXES.md) — postmortem for the four major bugs fixed
+- [`docs/QUICK_DEBUG_NOTES.md`](QUICK_DEBUG_NOTES.md) — quick bug/fix reference table
 - [`CLAUDE.md`](CLAUDE.md) — debugging workflow and session conventions
